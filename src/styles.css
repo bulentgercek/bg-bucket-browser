@@ -1,0 +1,400 @@
+/* The typeface ships with the app rather than coming from a CDN: an offline
+   machine should look the same as a connected one. Latin subset only, and no
+   weight heavier than medium anywhere in the interface. */
+@import "@fontsource/inter/latin-400.css";
+@import "@fontsource/inter/latin-500.css";
+@import "@fontsource/inter/latin-600.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ────────────────────────────────────────────────────────────────────────
+   The design tokens. Every colour in the app resolves to one of these, and no
+   component writes a literal colour: changing a shade here changes it
+   everywhere.
+   ──────────────────────────────────────────────────────────────────────── */
+:root {
+  --color-bg: #161826;
+  --color-surface: #232532;
+  --color-text: #e9e9ed;
+  --color-accent: #9184d9;
+  --color-divider: color-mix(in srgb, #e9e9ed 16%, transparent);
+
+  /* The window frame sits a shade below the page behind it. */
+  --color-chrome: #14161f; /* sidebar / status bar / left nav */
+  --gradient-titlebar: linear-gradient(180deg, #1b1d2c, #161826);
+
+  --color-neutral-100: #f3f5fe;
+  --color-neutral-200: #e4e7f5;
+  --color-neutral-300: #cfd3e5;
+  --color-neutral-400: #b2b6ca;
+  --color-neutral-500: #9397ab;
+  --color-neutral-600: #75798c;
+  --color-neutral-700: #595d6c;
+  --color-neutral-800: #3f424d;
+  --color-neutral-900: #292b31;
+
+  --color-accent-100: #f5f4ff;
+  --color-accent-200: #e7e5fe;
+  --color-accent-300: #d2cefd;
+  --color-accent-400: #b5abfc;
+  --color-accent-500: #968ae0;
+  --color-accent-600: #796cbf;
+  --color-accent-700: #5d5294;
+  --color-accent-800: #423a6a;
+  --color-accent-900: #2b2741;
+
+  /* The identity colour of this machine, answering the accent that stands for
+     the volume. Everything local carries it: the pane outline, its tab icon,
+     its pinned rows. Change the hue here and all of them follow. */
+  --color-local: #c9b071;
+  --color-local-100: #fbf6e9;
+  --color-local-200: #f2e8ce;
+  --color-local-300: #e6d4a0;
+  --color-local-400: #d4bd82;
+  --color-local-500: #b89f63;
+  --color-local-600: #9c8450;
+  --color-local-700: #7a6740;
+  --color-local-800: #5a4c30;
+  --color-local-900: #332c1c;
+
+  --font-body: "Inter", system-ui, sans-serif;
+  --font-heading: "Inter", system-ui, sans-serif;
+
+  --space-1: 2.8px;
+  --space-2: 5.6px;
+  --space-3: 8.4px;
+  --space-4: 11.2px;
+  --space-6: 16.8px;
+  --space-8: 22.4px;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 14px;
+
+  /* Border widths for controls, in one place.
+
+     The stronger one is for accented edges. A one-pixel border meeting another
+     border on a rounded corner leaves a smudge where the two are antialiased
+     together; two pixels stay opaque there. */
+  --stroke: 2px;
+  --stroke-strong: 2px;
+
+  --shadow-sm: 0 0 0 1px #3f424d;
+  --shadow-md: 0 0 0 1px #595d6c, 0 6px 18px rgba(0, 0, 0, 0.55);
+  --shadow-lg: 0 0 0 1px #9397ab, 0 16px 40px rgba(0, 0, 0, 0.65);
+
+  /* Something went wrong, and something needs care. */
+  --color-danger: #c9736b;
+  --color-warn: #e0a83a;
+
+  /* The glow at the foot of the active pane, in that side's own colour. */
+  --pane-lift-remote: color-mix(in srgb, var(--color-accent) 13%, transparent);
+  --pane-lift-local: color-mix(in srgb, var(--color-local) 13%, transparent);
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   The light theme. The chosen theme is always written onto the document root,
+   including when it follows the system, so no media query is needed here.
+
+   Each ramp keeps its meaning and inverts its lightness: the low end stays the
+   foreground and the high end stays the background, whichever theme is on. That
+   is what lets every component work in both without knowing which one it is
+   in. The hues do not change.
+   ──────────────────────────────────────────────────────────────────────── */
+:root[data-theme="light"] {
+  --color-bg: #f5f6fa;
+  --color-surface: #ffffff;
+  --color-text: #1c1e28;
+  --color-accent: #6f61c9;
+  --color-divider: color-mix(in srgb, #1c1e28 12%, transparent);
+
+  --color-chrome: #eceef4; /* a shade greyer than the page */
+  --gradient-titlebar: linear-gradient(180deg, #ffffff, #f5f6fa);
+
+  /* Low end: the darkest foreground. High end: hairlines and row hover. */
+  --color-neutral-100: #1a1c26;
+  --color-neutral-200: #2b2e3b;
+  --color-neutral-300: #414553;
+  --color-neutral-400: #575b6b;
+  --color-neutral-500: #6e7282;
+  --color-neutral-600: #8b8f9e;
+  --color-neutral-700: #b9bcc7;
+  --color-neutral-800: #dde0e8;
+  --color-neutral-900: #eceef4;
+
+  /* Low end: accented text. High end: the selection fill behind it. */
+  --color-accent-100: #322a66;
+  --color-accent-200: #443a86;
+  --color-accent-300: #564aa6;
+  --color-accent-400: #6a5cc4;
+  --color-accent-500: #7f72d9;
+  --color-accent-600: #9689e4;
+  --color-accent-700: #b3a8ee;
+  --color-accent-800: #d6d0f8;
+  --color-accent-900: #ece9fd;
+
+  --color-local: #9a7f42;
+  --color-local-100: #453814;
+  --color-local-200: #5a491d;
+  --color-local-300: #756033;
+  --color-local-400: #927b4c;
+  --color-local-500: #ad9564;
+  --color-local-600: #c6b184;
+  --color-local-700: #dccaa2;
+  --color-local-800: #ece1c6;
+  --color-local-900: #f7f2e5;
+
+  --shadow-sm: 0 0 0 1px #d9dbe3;
+  --shadow-md: 0 0 0 1px #c6c8d2, 0 6px 18px rgba(24, 26, 45, 0.12);
+  --shadow-lg: 0 0 0 1px #b2b5c1, 0 16px 40px rgba(24, 26, 45, 0.18);
+
+  --color-danger: #c0392b;
+  --color-warn: #a86a00;
+
+  /* A stronger mix than in the dark theme: a light background washes the
+     colour out. */
+  --pane-lift-remote: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  --pane-lift-local: color-mix(in srgb, var(--color-local) 20%, transparent);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+
+  /* Interface text is not selectable and the pointer stays an arrow: dragging
+     a selection across labels is the clearest sign that something is a web page
+     rather than an application. Text fields are exempt, below. */
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+input,
+textarea,
+[contenteditable] {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+/* Controls that are not text fields keep the pointing hand. */
+input[type="checkbox"],
+input[type="radio"],
+input[type="range"],
+input[type="color"],
+input[type="file"],
+input[type="button"],
+input[type="submit"] {
+  cursor: pointer;
+}
+
+/* One cursor for the whole drag: without this the shapes of whatever is under
+   the pointer show through and flicker. */
+body.dnd-dragging,
+body.dnd-dragging * {
+  cursor: grabbing !important;
+}
+
+/* Where selection is allowed, it is tinted with the accent. */
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 30%, transparent);
+}
+
+/* Scrollbars are styled rather than native. The system scrollbar is drawn on
+   its own layer and can appear on top of dialogs and menus; a styled one paints
+   in the normal order, and matches the design as well. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-neutral-800) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-neutral-800);
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-neutral-700);
+  background-clip: padding-box;
+}
+
+/* Headings are medium weight, never heavier. */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: var(--font-heading);
+  font-weight: 500;
+  line-height: 1.12;
+  letter-spacing: -0.015em;
+  margin: 0;
+}
+
+/* One focus ring everywhere; never the browser's own. */
+:focus {
+  outline: none;
+}
+:focus-visible {
+  outline: var(--stroke-strong) solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   The controls. Layout is done with utility classes in the components; how a
+   button, a field or a switch looks is decided here, once.
+   ──────────────────────────────────────────────────────────────────────── */
+@layer components {
+  /* — buttons — */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    cursor: pointer;
+    text-decoration: none;
+    font-family: var(--font-heading);
+    font-weight: 500;
+    font-size: 14px;
+    line-height: 1.2;
+    color: var(--color-text);
+    background: transparent;
+    border: var(--stroke) solid transparent;
+    padding: var(--space-2) calc(var(--space-3) * 1.2);
+    border-radius: var(--radius-md);
+  }
+  .btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  /* House rule: primary means an accent outline, never a filled button. */
+  .btn-primary {
+    color: var(--color-accent);
+    border-color: var(--color-accent);
+  }
+  .btn-primary:hover {
+    background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  }
+  .btn-primary:active {
+    background: color-mix(in srgb, var(--color-accent) 22%, transparent);
+  }
+  .btn-ghost {
+    color: var(--color-accent);
+    padding-inline: var(--space-1);
+  }
+  .btn-ghost:hover {
+    background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  }
+  .btn-ghost:active {
+    background: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  }
+  /* The two buttons of a question look alike; only the one the keyboard is on
+     is outlined. Neither answer should look like the expected one. */
+  .btn-choice {
+    color: var(--color-accent);
+  }
+  .btn-choice:hover {
+    background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  }
+  .btn-choice:active {
+    background: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  }
+  .btn-selected {
+    border-color: var(--color-accent);
+  }
+
+  /* — form fields — */
+  .field > label {
+    display: block;
+    font-size: 11.5px;
+    margin-bottom: 5px;
+    color: var(--color-neutral-400);
+  }
+  .input {
+    width: 100%;
+    min-height: 36px;
+    padding: 6px 10px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--color-text);
+    caret-color: var(--color-accent);
+    background: var(--color-surface);
+    border: var(--stroke) solid var(--color-divider);
+    border-radius: var(--radius-md);
+  }
+  .input:hover {
+    border-color: color-mix(in srgb, var(--color-text) 45%, transparent);
+  }
+  .input:focus-visible {
+    border-color: var(--color-accent);
+    outline-offset: 0;
+  }
+
+  /* — segmented control (Theme) — */
+  .seg {
+    display: inline-flex;
+    border: var(--stroke) solid var(--color-divider);
+    border-radius: var(--radius-md);
+    /* Deliberately not clipped: the end options round their own corners, and
+       clipping added a smudge where the two edges met. */
+  }
+  .seg-opt {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .seg-opt + .seg-opt {
+    border-left: var(--stroke) solid var(--color-divider);
+  }
+  /* The end options are rounded concentrically with the frame around them:
+     the inner radius is the outer one less the border width. Anything else
+     leaves the two curves fighting at the corner. */
+  .seg-opt:first-child {
+    border-top-left-radius: calc(var(--radius-md) - var(--stroke));
+    border-bottom-left-radius: calc(var(--radius-md) - var(--stroke));
+  }
+  .seg-opt:last-child {
+    border-top-right-radius: calc(var(--radius-md) - var(--stroke));
+    border-bottom-right-radius: calc(var(--radius-md) - var(--stroke));
+  }
+  .seg-opt:has(input:checked) {
+    color: var(--color-accent);
+    box-shadow: inset 0 0 0 var(--stroke-strong) var(--color-accent);
+  }
+  .seg-opt:not(:has(input:checked)):hover {
+    background: color-mix(in srgb, var(--color-text) 7%, transparent);
+  }
+  .seg-opt input {
+    position: absolute;
+    opacity: 0;
+    width: 0;
+    height: 0;
+    pointer-events: none;
+  }
+}

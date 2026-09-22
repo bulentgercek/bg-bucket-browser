@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default permissions for the main window (core API and the plugins in use). The app's own #[tauri::command] functions are outside this system and need no capability permission.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "window-state:default",
+    "store:default",
+    "clipboard-manager:allow-write-text"
+  ]
+}

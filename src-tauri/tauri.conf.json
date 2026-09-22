@@ -1,0 +1,61 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "BG Bucket Browser",
+  "version": "1.0.0",
+  "identifier": "com.bulentgercek.bgbucketbrowser",
+  "build": {
+    "beforeDevCommand": "node scripts/dev-server.mjs",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "BG Bucket Browser",
+        "width": 1160,
+        "height": 760,
+        "minWidth": 900,
+        "minHeight": 560,
+        "backgroundColor": "#161826"
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self'",
+        "img-src": "'self' data:",
+        "font-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "object-src": "'none'",
+        "base-uri": "'none'"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["appimage", "deb"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ],
+    "category": "Utility",
+    "publisher": "Bulent Gercek",
+    "copyright": "© 2026 Bulent Gercek",
+    "shortDescription": "Dual-pane S3 + local file manager",
+    "longDescription": "BG Bucket Browser is a dual-pane desktop file manager that puts a RunPod network volume (S3 API) side by side with the local disk: browse, transfer with resumable download / multipart upload, rename, delete to trash, and preview image and video thumbnails.",
+    "linux": {
+      "deb": {
+        "depends": ["libdbus-1-3"],
+        "postRemoveScript": "linux/deb-postrm.sh"
+      }
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "BG Bucket Browser",
+        "width": 1160,
+        "height": 760,
+        "minWidth": 900,
+        "minHeight": 560,
+        "backgroundColor": "#161826",
+        "dragDropEnabled": false
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["msi", "nsis"],
+    "windows": {
+      "wix": {
+        "fragmentPaths": ["windows/wix/open-here-cleanup.wxs"],
+        "componentRefs": ["OpenHereRegistryCleanup"]
+      },
+      "nsis": {
+        "installerHooks": "windows/nsis/installer-hooks.nsh"
+      }
+    }
+  }
+}

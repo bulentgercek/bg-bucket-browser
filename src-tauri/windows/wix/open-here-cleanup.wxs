@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Removes the folder context menu entry when the app is uninstalled.
+
+  That entry is written by the app itself, from its own settings, so the
+  installer never created it and would otherwise leave it behind.
+
+  The registry value is only there because every component needs one: it is a
+  harmless marker of its own, nothing the app reads.
+
+  The component's identifier must never change. A different one is a different
+  component as far as the installer is concerned, and the old key would never be
+  removed again.
+
+  The architecture is written out rather than taken from a variable: each source
+  file is compiled in its own process, and a variable defined in the main one
+  never reaches this fragment.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="TARGETDIR">
+      <Component Id="OpenHereRegistryCleanup" Guid="E03CC354-AE6D-44AF-8539-6A12865AD3CA" Win64="yes">
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\BGBucketBrowser"
+          Name="OpenHereCleanupMarker"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+        <RemoveRegistryKey
+          Root="HKCU"
+          Key="Software\Classes\Directory\shell\BGBucketBrowserOpenHere"
+          Action="removeOnUninstall" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

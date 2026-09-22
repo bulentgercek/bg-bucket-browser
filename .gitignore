@@ -1,0 +1,13 @@
+/src-tauri/target
+/src-tauri/gen/schemas
+
+/node_modules
+/dist
+
+/src-tauri/*secrets.env*
+
+/src-tauri/~
+*.bgdl
+*.bgul
+*.part
+

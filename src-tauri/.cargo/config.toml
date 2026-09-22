@@ -1,0 +1,7 @@
+# Runs the development binary through a wrapper that signs it first; see the
+# script itself for why. macOS targets only — the other platforms are unaffected.
+[target.x86_64-apple-darwin]
+runner = "scripts/codesign-runner.sh"
+
+[target.aarch64-apple-darwin]
+runner = "scripts/codesign-runner.sh"

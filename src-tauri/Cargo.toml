@@ -1,0 +1,164 @@
+[package]
+name = "bg-bucket-browser"
+version = "1.0.0"
+authors = ["Bulent Gercek"]
+edition = "2024"
+license = "Apache-2.0"
+
+# The app is built as a library with a thin entry point: the setup lives in the
+# library, and the binary only calls into it.
+[lib]
+name = "bg_bucket_browser"
+
+# Runs before the build and turns the app's configuration into generated code:
+# permissions, icons, the manifest.
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The desktop shell: the window, the webview, and the bridge between them and
+# Rust. No browser is bundled; the system's own webview is used.
+tauri = { version = "2", features = [] }
+
+# Remembers the window's position and size between runs, and brings a window
+# that would open off-screen back into view.
+tauri-plugin-window-state = "2"
+
+# The S3 client. A custom endpoint and path-style addressing are what the
+# gateway needs, and this supports both; its own re-exports cover the
+# configuration types, so no separate configuration crate is needed.
+aws-sdk-s3 = "1"
+
+# Already under the SDK, but named directly for the one type that lets a request
+# be signed without hashing its body — which is what the gateway requires.
+aws-runtime = "1"
+
+# The async runtime every SDK call needs. Beyond the scheduler and its macros,
+# the feature list covers running ffmpeg as a process and giving it a timeout.
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "process",
+  "time",
+] }
+
+# Access to the operating system's own credential store, one API over three
+# backends.
+#
+# The backend is chosen per platform in the blocks below, never here: without one
+# the crate compiles anyway and falls back to a store that only lives in memory.
+# Saving then looks like it worked and the keys are gone on the next run.
+keyring = { version = "3" }
+
+# Turning Rust values into JSON and back: settings, transfer state, everything
+# written to disk.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hashing, for naming cached thumbnails. Already in the tree through the SDK.
+md-5 = "0.10"
+
+# The JSON file both sides read: the frontend through its own persistence
+# layer, Rust through this plugin. Secrets never go here — they go to the
+# keychain.
+tauri-plugin-store = "2"
+
+# Writing text to the clipboard. The webview's own clipboard API is not
+# reliable on every platform this runs on.
+tauri-plugin-clipboard-manager = "2"
+
+# Lists the mounted disks for the sidebar. Only the disk part of it is used.
+sysinfo = { version = "0.39", default-features = false, features = ["disk"] }
+
+# Moves local files to the desktop's own trash, so a deletion can be undone.
+# The volume has no trash of its own.
+trash = "5"
+
+# Packs downloaded objects into one archive, without compressing them: model
+# files do not compress, and the CPU time would be spent for nothing.
+zip = { version = "2", default-features = false }
+
+# Decoding and scaling images for thumbnails. Only the formats the app actually
+# offers previews for are enabled, to keep the binary down; output is always
+# JPEG.
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "gif",
+  "bmp",
+  "tiff",
+  "webp",
+] }
+
+# Thumbnails reach the frontend as data URIs, which this encodes.
+base64 = "0.22"
+
+# Opens a file or folder in whatever the system uses for it, and returns as soon
+# as it has launched rather than waiting for it to close.
+opener = "0.8"
+
+# Reads the file list off the OS clipboard, which the clipboard plugin's own API
+# does not expose. The plugin already depends on this crate; naming it directly
+# costs nothing and gives access to that one call.
+arboard = { version = "3", default-features = false, features = [
+  "wayland-data-control",
+] }
+
+# Percent-encoding for the paths written to the clipboard: a name with a space
+# or a special character would otherwise be parsed wrongly by whoever pastes it.
+# Already in the tree.
+percent-encoding = "2"
+
+# The one plain HTTP call this app makes: the account API that knows a volume's
+# total size, which S3 itself has no concept of.
+#
+# TLS is done in Rust rather than through the system's library, so the packaged
+# app does not depend on what is installed where it runs.
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+  "json",
+] }
+
+# Local timestamps for the development log (devlog.rs). Already in the tree via other crates.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+# Tests only: stands in for the network and hands back the request the SDK would
+# have sent, so the gateway fixes in core.rs are checked on what the SDK really
+# produces.
+aws-smithy-http-client = { version = "1", features = ["test-util"] }
+# Tests only: the canned responses those tests answer with.
+http = "1"
+
+[features]
+# The webview inspector in a release build, for testing a packaged app; debug
+# builds always have it. Off by default, so packages ship without it:
+# `npx tauri build --features devtools`.
+devtools = ["tauri/devtools"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Telling a cut from a copy, which needs to ask what else the clipboard is
+# offering alongside the file list. Only this crate exposes that, and only on
+# Wayland; everywhere else the safe default of "copy" stands.
+wl-clipboard-rs = "0.9"
+
+# Dragging a file out of the window onto the desktop. Still a prototype: it is
+# reached from one temporary menu entry and nothing else.
+drag = "2"
+
+# The keychain backend for this platform; see the note on the base dependency.
+# The blocking variant needs no async runtime, and the session encryption is done
+# in Rust rather than through a system library.
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The keychain backend for this platform; see the note on the base dependency.
+keyring = { version = "3", features = ["windows-native"] }
+
+# Registry access for the folder context menu entry, written per user so that it
+# never needs administrator rights.
+winreg = "0.52"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The keychain backend for this platform; see the note on the base dependency.
+keyring = { version = "3", features = ["apple-native"] }

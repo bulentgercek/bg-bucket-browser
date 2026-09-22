@@ -1,0 +1,12 @@
+#!/bin/sh
+# Runs the app in development mode:  ./dev
+#
+# A POSIX shell script, so Linux and macOS only; on Windows run the Tauri CLI
+# directly. What it works around was seen on one development machine's shell and
+# may never appear elsewhere — it is harmless either way, since it ends up
+# running the same command.
+#
+# It deliberately does not go through the package manager: when the window is
+# closed, a process in the tree is killed by a signal, and npm then reports a
+# failure even though the script itself exited cleanly.
+exec sh "$(dirname "$0")/scripts/dev-app.sh"
