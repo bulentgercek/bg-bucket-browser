@@ -74,11 +74,11 @@ packaging format for each platform. The one platform-specific behavior is
 the OS-drag-in limitation on Windows/macOS noted under Features; everything
 else works the same way on all three.
 
-| Platform | Tested on | Package formats |
-|---|---|---|
-| Linux | CachyOS (Arch) | AppImage, `.deb` |
-| Windows | Windows 11 (VM) | `.msi`, NSIS (`.exe`) |
-| macOS | macOS Monterey (Hackintosh VM) | `.dmg` |
+| Platform | Package formats |
+|---|---|
+| Linux | AppImage, `.deb` |
+| Windows | `.msi`, NSIS (`.exe`) |
+| macOS | `.dmg` |
 
 ## Requirements
 
@@ -94,10 +94,26 @@ else works the same way on all three.
 
 ## Installing
 
-Prebuilt packages are not distributed. Build from source, on the machine
-you want to run it on — Tauri's native dependencies (`aws-lc-sys`, WebView
-bindings) do not cross-compile between operating systems, so a Linux build
-cannot produce a Windows or macOS package and vice versa.
+**macOS:** a prebuilt package is published with each release. Download
+`BG Bucket Browser_<version>_x64.dmg` from the
+[Releases](https://github.com/bulentgercek/bg-bucket-browser/releases) page,
+open it and drag the app to Applications. It is not signed or notarized, so
+the first launch has to go past Gatekeeper: right-click the app and choose
+Open, or clear the quarantine flag with
+
+```
+xattr -dr com.apple.quarantine "/Applications/BG Bucket Browser.app"
+```
+
+The package is built for Intel (x64) and runs on Apple Silicon through
+Rosetta 2.
+
+**Windows and Linux:** no prebuilt packages. Build from source, on the
+machine you want to run it on — Tauri's native dependencies (`aws-lc-sys`,
+WebView bindings) do not cross-compile between operating systems, so a Linux
+build cannot produce a Windows or macOS package and vice versa. The same
+steps also build the macOS package yourself, if you would rather not use the
+published one.
 
 ```
 git clone <repository-url>
