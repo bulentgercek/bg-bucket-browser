@@ -95,7 +95,7 @@ else works the same way on all three.
 ## Installing
 
 **macOS:** a prebuilt package is published with each release. Download
-`BG Bucket Browser_<version>_x64.dmg` from the
+`BG-Bucket-Browser_<version>_x64.dmg` from the
 [Releases](https://github.com/bulentgercek/bg-bucket-browser/releases) page,
 open it and drag the app to Applications. It is not signed or notarized, so
 the first launch has to go past Gatekeeper: right-click the app and choose
