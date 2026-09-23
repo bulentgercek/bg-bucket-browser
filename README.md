@@ -74,11 +74,11 @@ packaging format for each platform. The one platform-specific behavior is
 the OS-drag-in limitation on Windows/macOS noted under Features; everything
 else works the same way on all three.
 
-| Platform | Package formats |
-|---|---|
-| Linux | AppImage, `.deb` |
-| Windows | `.msi`, NSIS (`.exe`) |
-| macOS | `.dmg` |
+| Platform | Package formats       |
+| -------- | --------------------- |
+| Linux    | AppImage, `.deb`      |
+| Windows  | `.msi`, NSIS (`.exe`) |
+| macOS    | `.dmg`                |
 
 ## Requirements
 
@@ -94,12 +94,27 @@ else works the same way on all three.
 
 ## Installing
 
-**macOS:** a prebuilt package is published with each release. Download
-`BG-Bucket-Browser_<version>_x64.dmg` from the
-[Releases](https://github.com/bulentgercek/bg-bucket-browser/releases) page,
-open it and drag the app to Applications. It is not signed or notarized, so
-the first launch has to go past Gatekeeper: right-click the app and choose
-Open, or clear the quarantine flag with
+Prebuilt packages are published with each release on the
+[Releases](https://github.com/bulentgercek/bg-bucket-browser/releases) page.
+
+**Linux:** no prebuilt package. A build made on your own system links against
+its own libraries, so it runs there without compatibility issues — see
+Building from source.
+
+**Windows:** two packages, both 64-bit:
+
+- `BG-Bucket-Browser_<version>_x64-setup.exe` installs for the current user
+  and does not ask for administrator rights.
+- `BG-Bucket-Browser_<version>_x64_en-US.msi` installs for all users and
+  needs administrator rights.
+
+Neither is signed, so SmartScreen warns on the first run: choose More info,
+then Run anyway.
+
+**macOS:** download `BG-Bucket-Browser_<version>_x64.dmg`, open it and drag the
+app to Applications. It is not signed or notarized, so macOS blocks the first
+launch. Open the app once, then go to System Settings → Privacy & Security and
+choose Open Anyway. Or clear the quarantine flag from Terminal:
 
 ```
 xattr -dr com.apple.quarantine "/Applications/BG Bucket Browser.app"
@@ -108,18 +123,38 @@ xattr -dr com.apple.quarantine "/Applications/BG Bucket Browser.app"
 The package is built for Intel (x64) and runs on Apple Silicon through
 Rosetta 2.
 
-**Windows and Linux:** no prebuilt packages. Build from source, on the
-machine you want to run it on — Tauri's native dependencies (`aws-lc-sys`,
-WebView bindings) do not cross-compile between operating systems, so a Linux
-build cannot produce a Windows or macOS package and vice versa. The same
-steps also build the macOS package yourself, if you would rather not use the
-published one.
+## Building from source
+
+Build on the machine you want to run it on: Tauri's native dependencies
+(`aws-lc-sys`, WebView bindings) do not cross-compile between operating
+systems, so a Linux build cannot produce a Windows or macOS package and vice
+versa. This is also how to get a Windows or macOS build of your own instead of
+the published package.
+
+### 1. Prerequisites
+
+Every platform needs Rust, installed with [rustup](https://rustup.rs), and
+Node.js, from [nodejs.org](https://nodejs.org). On top of that:
+
+- **Linux:** a C toolchain and the WebKitGTK and D-Bus development files
+  (Debian/Ubuntu package names):
+
+  ```
+  sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev libdbus-1-dev
+  ```
+
+- **Windows:** the MSVC build tools, installed via rustup or Visual Studio.
+- **macOS:** Xcode Command Line Tools: `xcode-select --install`
+
+### 2. Get the source
 
 ```
-git clone <repository-url>
+git clone https://github.com/bulentgercek/bg-bucket-browser.git
 cd bg-bucket-browser
 npm install
 ```
+
+### 3. Build
 
 **Linux:**
 
@@ -133,14 +168,13 @@ Fedora 39+, Ubuntu 24.04+). Runtime dependencies on Debian-based systems
 (`libwebkit2gtk-4.1-0`, `libgtk-3-0`, `libdbus-1-3`) are installed
 automatically with the `.deb` package.
 
-**Windows** (needs the MSVC build tools, installed via Rust's
-[rustup](https://rustup.rs) or Visual Studio):
+**Windows:**
 
 ```
 npx tauri build --bundles msi,nsis
 ```
 
-**macOS** (needs Xcode Command Line Tools: `xcode-select --install`):
+**macOS:**
 
 ```
 npx tauri build --bundles dmg
