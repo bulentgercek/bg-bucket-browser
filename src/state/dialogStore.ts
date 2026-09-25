@@ -25,6 +25,9 @@ export interface ConfirmDialog extends DialogBase {
   cancelLabel?: string;
   danger?: boolean;
   onConfirm: () => void;
+  /** Runs when the cancel button is chosen; dismissing the dialog does not
+      call it, so Escape or a click outside never counts as that answer. */
+  onCancel?: () => void;
 }
 
 export interface InfoDialog extends DialogBase {

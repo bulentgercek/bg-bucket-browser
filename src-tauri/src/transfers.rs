@@ -247,7 +247,13 @@ struct Resume {
 enum Outcome {
     Done,
     Canceled,
+    /// Nothing was written; the reason is shown to the user. A Move keeps its source.
+    Skipped(String),
 }
+
+/// A single-item job met a name at the destination that the interface did not see.
+const SKIP_TAKEN: &str = "not transferred: the name is already taken at the destination";
+const SKIP_SAME: &str = "not transferred: source and destination are the same";
 
 /// Queues one transfer and returns its id, which every later event carries.
 #[tauri::command]
@@ -450,6 +456,7 @@ fn ensure_worker(app: AppHandle, mgr: TransferManager) {
             let outcome = match &result {
                 Ok(Outcome::Done) => format!("done {id} {ms}ms"),
                 Ok(Outcome::Canceled) => format!("canceled {id} {ms}ms"),
+                Ok(Outcome::Skipped(why)) => format!("skipped {id} {ms}ms {why}"),
                 Err(detail) => format!("error {id} {ms}ms {detail}"),
             };
             crate::devlog::verbose("transfer", outcome);
@@ -474,7 +481,8 @@ fn ensure_worker(app: AppHandle, mgr: TransferManager) {
                 Ok(Outcome::Canceled) => {
                     let _ = app.emit("transfer-canceled", IdEvt { id });
                 }
-                Err(detail) => {
+                // Reported like an error, so the user learns the item did not arrive.
+                Ok(Outcome::Skipped(detail)) | Err(detail) => {
                     let _ = app.emit("transfer-error", ErrEvt { id, detail });
                 }
             }
@@ -566,6 +574,7 @@ async fn run_open_download(app: &AppHandle, job: &Job) -> Result<Outcome, String
     .await?
     {
         Outcome::Canceled => Ok(Outcome::Canceled),
+        Outcome::Skipped(why) => Ok(Outcome::Skipped(why)),
         Outcome::Done => {
             make_read_only(&cache_path);
             opener::open(&cache_path).map_err(|e| e.to_string())?;
@@ -706,7 +715,7 @@ fn nested_dir_prefixes(root: &str, keys: &[String]) -> Vec<String> {
 
 /// Remote path as a prefix: `""` stays empty, `"a/b"` becomes `"a/b/"`.
 fn as_prefix(path: &str) -> String {
-    match path.trim().trim_matches('/') {
+    match path.trim_matches('/') {
         "" => String::new(),
         p => format!("{p}/"),
     }
@@ -798,7 +807,7 @@ fn s3_job(app: &AppHandle, conn_id: &Option<String>) -> Result<(Client, String),
 }
 
 fn remote_key(path: &str) -> String {
-    path.trim().trim_start_matches('/').to_string()
+    path.trim_start_matches('/').to_string()
 }
 
 /// True when a path taken from a remote key stays inside the folder it is
@@ -884,6 +893,7 @@ async fn run_download(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
         {
             Outcome::Canceled => return Ok(Outcome::Canceled),
             Outcome::Done => job.sent_remote.lock().unwrap().push(key.clone()),
+            Outcome::Skipped(_) => {}
         }
         done += *sz;
     }
@@ -921,7 +931,7 @@ async fn download_one(
     // Name already taken: skip returns, rename picks a free name, overwrite keeps going.
     let target: PathBuf = if out_path.exists() {
         match conflict {
-            "skip" => return Ok(Outcome::Done),
+            "skip" => return Ok(Outcome::Skipped(SKIP_TAKEN.into())),
             "rename" => {
                 let dir = out_path
                     .parent()
@@ -1145,7 +1155,12 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
     let dest_root = resolve_local(&job.dest_dir)?;
     fs::create_dir_all(&dest_root).map_err(|e| e.to_string())?;
     let base = job.name.strip_suffix(".zip").unwrap_or(&job.name);
-    let out_path = dest_root.join(format!("{base}.zip"));
+    let zip_name = format!("{base}.zip");
+    // The archive is built under a hidden name and takes its real one only when
+    // complete. A `.zip` already sitting there is the user's own and is never
+    // opened, resumed into or deleted.
+    let final_path = dest_root.join(&zip_name);
+    let out_path = dot_sibling(&final_path, ".part");
 
     // Members as (remote key, path inside the archive, size, etag).
     let mut members: Vec<(String, String, u64, String)> = Vec::new();
@@ -1201,7 +1216,7 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
 
     // A zip is resumable: members already inside the archive with the right size are skipped,
     // and before each new member the archive is copied to a `.ckpt` file it can be restored from.
-    let ckpt = dot_sibling(&out_path, ".ckpt");
+    let ckpt = dot_sibling(&final_path, ".ckpt");
 
     let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
     if out_path.exists() {
@@ -1323,6 +1338,9 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
     }
 
     let _ = fs::remove_file(&ckpt);
+    // A name taken in the meantime, or from the start, gets the next " copy" name.
+    let name = free_local_name(&dest_root, &zip_name);
+    fs::rename(&out_path, dest_root.join(&name)).map_err(|e| e.to_string())?;
     emit_progress(app, &job.id, grand_total, grand_total, 0);
     Ok(Outcome::Done)
 }
@@ -1339,7 +1357,7 @@ async fn run_local_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
         return Err(ERR_INTO_ITSELF.into());
     }
     if src == dest {
-        return Ok(Outcome::Done); // source and destination are the same path
+        return Ok(Outcome::Skipped(SKIP_SAME.into()));
     }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1384,6 +1402,7 @@ async fn run_local_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
             )? {
                 Outcome::Canceled => return Ok(Outcome::Canceled),
                 Outcome::Done => job.sent_local.lock().unwrap().push(path.clone()),
+                Outcome::Skipped(_) => {}
             }
             done += *sz;
         }
@@ -1411,7 +1430,7 @@ fn copy_file_chunked(
 
     let target: PathBuf = if dst.exists() {
         match conflict {
-            "skip" => return Ok(Outcome::Done),
+            "skip" => return Ok(Outcome::Skipped(SKIP_TAKEN.into())),
             "rename" => {
                 let dir = dst.parent().map(|p| p.to_path_buf()).unwrap_or_default();
                 let nm = dst.file_name().and_then(|n| n.to_str()).unwrap_or("file");
@@ -1485,14 +1504,14 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
             "skip" => {
                 let k = format!("{dest_prefix}{name}");
                 if head_ok(&client, &bucket, &k).await {
-                    return Ok(Outcome::Done);
+                    return Ok(Outcome::Skipped(SKIP_TAKEN.into()));
                 }
                 k
             }
             _ => format!("{dest_prefix}{name}"), // overwrite: the PUT replaces it
         };
         if src_key == dest_key {
-            return Ok(Outcome::Done);
+            return Ok(Outcome::Skipped(SKIP_SAME.into()));
         }
         // The result is passed through unchanged.
         return remote_copy_stream(
@@ -1514,6 +1533,18 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
     let mut done: u64 = 0;
     emit_progress(app, &job.id, 0, total, 0);
 
+    // With `skip`, an object already at the destination is left as it is and its
+    // source is not counted as sent, the same as a folder download does.
+    let taken: std::collections::HashSet<String> = if job.conflict == "skip" {
+        list_objects_all(&client, &bucket, &dest_prefix)
+            .await?
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     for (key, sz, _) in &objects {
         let rel = key.strip_prefix(&src_prefix).unwrap_or(key);
         let dest_key = format!("{dest_prefix}{rel}");
@@ -1521,6 +1552,10 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
             return Ok(Outcome::Canceled);
         }
         if rel.is_empty() {
+            continue;
+        }
+        if taken.contains(&dest_key) {
+            done += *sz;
             continue;
         }
         emit_current_file(app, &job.id, rel);
@@ -1532,6 +1567,7 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
         {
             Outcome::Canceled => return Ok(Outcome::Canceled),
             Outcome::Done => job.sent_remote.lock().unwrap().push(key.clone()),
+            Outcome::Skipped(_) => {}
         }
         done += *sz;
     }
@@ -1803,7 +1839,7 @@ async fn run_upload(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
             "skip" => {
                 let k = format!("{dest_prefix}{name}");
                 if head_ok(&client, &bucket, &k).await {
-                    return Ok(Outcome::Done);
+                    return Ok(Outcome::Skipped(SKIP_TAKEN.into()));
                 }
                 k
             }
@@ -1823,16 +1859,17 @@ async fn run_upload(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
     let mut done: u64 = 0;
     emit_progress(app, &job.id, 0, total, 0);
 
-    // Objects already there with the same size are skipped, so a half-done folder upload continues.
-    let existing: HashMap<String, u64> = if job.conflict == "skip" {
+    // With `skip`, an object already at the destination is left as it is and its
+    // file is not counted as sent. That is also what lets a half-done folder
+    // upload continue: an unfinished multipart upload is not an object yet.
+    let existing: std::collections::HashSet<String> = if job.conflict == "skip" {
         list_objects_all(&client, &bucket, &dest_prefix)
-            .await
-            .unwrap_or_default()
+            .await?
             .into_iter()
-            .map(|(key, sz, _)| (key, sz))
+            .map(|(key, _, _)| key)
             .collect()
     } else {
-        HashMap::new()
+        std::collections::HashSet::new()
     };
 
     for (path, sz, rel) in &files {
@@ -1840,7 +1877,7 @@ async fn run_upload(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
         if job.cancel.load(Ordering::Relaxed) {
             return Ok(Outcome::Canceled);
         }
-        if existing.get(&key) == Some(sz) {
+        if existing.contains(&key) {
             done += *sz;
             emit_progress(app, &job.id, done, total, 0);
             continue;
@@ -1854,6 +1891,7 @@ async fn run_upload(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
         {
             Outcome::Canceled => return Ok(Outcome::Canceled),
             Outcome::Done => job.sent_local.lock().unwrap().push(path.clone()),
+            Outcome::Skipped(_) => {}
         }
         done += *sz;
     }
@@ -2619,7 +2657,7 @@ mod name_tests {
     fn prefix_of_a_remote_path() {
         assert_eq!(as_prefix(""), "");
         assert_eq!(as_prefix("/"), "");
-        assert_eq!(as_prefix("  "), "");
+        assert_eq!(as_prefix("  "), "  /"); // spaces are a name
         assert_eq!(as_prefix("a/b"), "a/b/");
         assert_eq!(as_prefix("/a/b/"), "a/b/");
         assert_eq!(as_prefix("a//"), "a/");

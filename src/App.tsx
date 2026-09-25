@@ -3,6 +3,7 @@ import { useUiStore } from "./state/uiStore";
 import { useConnectionStore } from "./state/connectionStore";
 import { useDeviceStore } from "./state/deviceStore";
 import { initTransferEvents } from "./state/transferQueueStore";
+import { useFeedbackStore } from "./state/feedbackStore";
 import { initOsDrop } from "./lib/osDrop";
 import MainScreen from "./features/main/MainScreen";
 import SettingsScreen from "./features/settings/SettingsScreen";
@@ -44,6 +45,8 @@ export default function App() {
     void useConnectionStore.getState().load();
     void useDeviceStore.getState().load();
     void initTransferEvents();
+    // A feedback recording left from the last run is offered again.
+    void useFeedbackStore.getState().init();
     void initOsDrop();
 
     const onCtx = (e: MouseEvent) => {

@@ -7,6 +7,7 @@ pub mod core;
 pub mod desktop_integration;
 pub mod devices;
 pub mod devlog;
+pub mod feedback;
 pub mod fs_ops;
 pub mod listing;
 pub mod local_path;
@@ -67,6 +68,12 @@ pub fn run() {
             devices::local_home_dir,
             devlog::devlog_toast,
             devlog::devlog_verbose,
+            feedback::feedback_record_start,
+            feedback::feedback_record_stop,
+            feedback::feedback_recording,
+            feedback::feedback_discard_recording,
+            feedback::feedback_is_test,
+            feedback::feedback_send,
             fs_ops::create_folder,
             fs_ops::create_file,
             fs_ops::rename,

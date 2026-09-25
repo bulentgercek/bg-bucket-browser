@@ -1,6 +1,6 @@
 [package]
 name = "bg-bucket-browser"
-version = "1.0.0"
+version = "1.1.0"
 authors = ["Bulent Gercek"]
 edition = "2024"
 license = "Apache-2.0"
@@ -67,8 +67,8 @@ tauri-plugin-store = "2"
 # reliable on every platform this runs on.
 tauri-plugin-clipboard-manager = "2"
 
-# Lists the mounted disks for the sidebar. Only the disk part of it is used.
-sysinfo = { version = "0.39", default-features = false, features = ["disk"] }
+# Lists the mounted disks for the sidebar, and names the OS version in feedback reports.
+sysinfo = { version = "0.39", default-features = false, features = ["disk", "system"] }
 
 # Moves local files to the desktop's own trash, so a deletion can be undone.
 # The volume has no trash of its own.

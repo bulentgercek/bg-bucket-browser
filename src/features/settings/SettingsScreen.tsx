@@ -7,6 +7,7 @@ import {
   HardDrivesIcon,
   PaintBrushIcon,
   InfoIcon,
+  ChatCircleTextIcon,
   CheckCircleIcon,
   WarningCircleIcon,
   CircleNotchIcon,
@@ -37,6 +38,7 @@ import { useToastStore } from "../../state/toastStore";
 import { formatSize } from "../../lib/format";
 import { IS_WINDOWS, IS_MACOS } from "../../lib/platform";
 import { t } from "../../locale/en";
+import FeedbackSection from "./FeedbackSection";
 
 /* The Settings screen: connections, appearance, and what this app is.
 
@@ -743,6 +745,12 @@ export default function SettingsScreen() {
             onClick={() => setNav("appearance")}
           />
           <NavItem
+            icon={ChatCircleTextIcon}
+            label={t("settings.nav.feedback")}
+            active={nav === "feedback"}
+            onClick={() => setNav("feedback")}
+          />
+          <NavItem
             icon={InfoIcon}
             label={t("settings.nav.about")}
             active={nav === "about"}
@@ -844,6 +852,8 @@ export default function SettingsScreen() {
               </div>
             </div>
           )}
+
+          {nav === "feedback" && <FeedbackSection />}
 
           {nav === "about" && (
             <div className="flex max-w-[640px] flex-col gap-[14px] px-[34px] py-[26px]">

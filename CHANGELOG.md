@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.1.0 - 2026-09-25
+
+Data-safety fixes and in-app feedback. Released under the Apache License 2.0,
+as before.
+
+### New: feedback from inside the app
+
+- Settings → Feedback: write a message and send it with one press. No email
+  client or GitHub account is needed; an email address for a reply is
+  optional.
+- **Record the problem** captures a detailed log for up to five minutes while
+  you reproduce an issue; a pill in the status bar shows the time and stops
+  it. The recording is attached in its own read-only box, so you see exactly
+  what will be sent. A recording cut short by a crash is offered again on the
+  next start.
+- The report goes over HTTPS only when you press Send. The recording contains
+  file names and paths, never credentials.
+
+### Fixes: nothing is deleted that was not really moved
+
+- A single-file move no longer deletes its source when the name turns out to
+  be taken at the destination while the transfer runs; the item is reported
+  as not transferred.
+- Copying or moving a folder from volume to volume, and uploading a folder,
+  now leave files already at the destination alone, and a move keeps their
+  sources.
+- Renaming on a volume checks the copy's size before the original is
+  removed.
+- Cut and paste remember which volume the items came from; pasting while
+  another volume is active is refused instead of acting on a same-named file
+  there.
+- After switching volumes, tabs that were out of view list the new volume
+  instead of showing the old one's files.
+- Names that begin or end with a space are no longer trimmed, so deleting
+  `models ` no longer deletes `models`.
+- Download as Zip never overwrites or appends to a `.zip` already in the
+  destination; the new archive gets a free "copy" name instead.
+- A folder listing that arrives late lands in the tab that asked for it.
+- Items hidden by the filter or by the hidden-files setting leave the
+  selection, so Delete and the other actions only take what is on screen.
+
 ## 1.0.0 - 2026-09-23
 
 First release. Released under the Apache License 2.0.

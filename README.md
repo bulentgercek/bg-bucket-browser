@@ -1,6 +1,6 @@
 # BG Bucket Browser
 
-Version 1.0.0
+Version 1.1.0
 
 Created by Bulent Gercek
 
@@ -57,6 +57,11 @@ application replaces both with a direct, always-available file manager.
   installers (`.deb`, NSIS, MSI) also clean up their own registration on
   uninstall; an AppImage has no install/uninstall step, so switching the
   toggle off before deleting it is the only way to remove the registration.
+- In-app feedback (Settings → Feedback): write a message and send it with one
+  press, with no email client or GitHub account needed. **Record the problem**
+  captures a detailed log for up to five minutes while you reproduce an issue;
+  it is attached in its own read-only box, so you see exactly what will be
+  sent. A recording cut short by a crash is offered again on the next start.
 - Light, dark, and system theme.
 
 ## Non-goals
@@ -201,7 +206,8 @@ Toolchain used during development: Rust 1.98, Node.js 26.
 ### Debug logging
 
 The application keeps a development log of its own, in two files, wherever the
-operating system puts application logs:
+operating system puts application logs (a third one exists only while a
+feedback recording runs, see below):
 
 - Linux: `~/.local/share/com.bulentgercek.bgbucketbrowser/logs/`
 - Windows: `%LOCALAPPDATA%\com.bulentgercek.bgbucketbrowser\logs\`
@@ -219,6 +225,16 @@ or crashed.
 development one. `BGBB_LOG=verbose` turns it on, `BGBB_LOG=quiet` turns it off.
 Neither file is configurable from the interface, neither is sent anywhere, and
 credentials are never written to either.
+
+While you record a problem from Settings → Feedback, the same detail is also
+written to `recording.log` in that folder, whatever the verbose setting is.
+It contains file names and paths, but no credentials. It leaves your computer
+only when you press **Send**: the report goes over HTTPS to
+`https://bulentgercek.com/feedback`, which forwards it to the developer by
+email and deletes its copy 30 days after delivery. The file is deleted once the report is
+accepted, or when you remove the recording. A build made from a development
+checkout sends to the service's test channel, where nothing is stored or
+delivered.
 
 ## Architecture
 

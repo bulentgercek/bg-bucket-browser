@@ -172,6 +172,8 @@ export const en = {
   "transfer.nothingToTransfer": "Nothing selected to transfer",
   "transfer.zipRemoteOnly": "Download as Zip works on the remote panel",
   "transfer.intoItself": "Can't copy or move \"{name}\" into itself",
+  "clipboard.otherVolume": "The clipboard holds items from {name}. Switch back to that volume to paste them.",
+  "clipboard.unknownVolume": "another volume",
 
   // The transfer queue panel
   "queue.title": "Transfers",
@@ -195,6 +197,7 @@ export const en = {
   "settings.back": "Back to Main Window",
   "settings.nav.connections": "Connections",
   "settings.nav.appearance": "Appearance",
+  "settings.nav.feedback": "Feedback",
   "settings.nav.about": "About",
 
   "settings.appearance.heading": "Appearance",
@@ -344,6 +347,46 @@ export const en = {
   "testError.noCredentials":
     "No credentials — enter the access and secret key, or Save first",
   "testError.unknown": "Connection failed",
+
+  "feedback.heading": "Feedback",
+  "feedback.subline":
+    "Something went wrong, or something is missing? Tell me here. It comes straight to my inbox.",
+  "feedback.message.label": "Your message",
+  "feedback.message.placeholder": "What happened, and what did you expect?",
+  "feedback.contact.label": "Your email (optional)",
+  "feedback.contact.hint": "Only used to reply to you.",
+  "feedback.record": "Record the problem",
+  "feedback.record.howto":
+    "Settings closes. Do what caused the problem, then press Stop & send at the bottom of the window. Up to 5 minutes.",
+  "feedback.record.warning":
+    "While recording, the app writes a detailed log, including file names and paths. It is sent with your message.",
+  "feedback.recording.title": "Recording · attached automatically",
+  "feedback.recording.meta": "{duration} · {lines} lines",
+  "feedback.recording.cutShort": "Cut short when the app closed unexpectedly",
+  "feedback.recording.remove": "Remove",
+  "feedback.send": "Send",
+  "feedback.sending": "Sending…",
+  "feedback.sent": "Thank you! Feedback sent (reference {id})",
+  "feedback.testChannel":
+    "Development build: reports go to the service's test channel and are not delivered.",
+  "feedback.err.invalid": "The report was not accepted. Please check what you entered.",
+  "feedback.err.invalidContact": "That email address doesn't look right",
+  "feedback.err.tooLarge": "The report is too large to send",
+  "feedback.err.rateLimited":
+    "Too many reports from this network. Please try again later; your message is kept.",
+  "feedback.err.server":
+    "The feedback service had a problem. Please try again later; your message is kept.",
+  "feedback.err.network":
+    "Couldn't reach the feedback service. Check your connection; your message is kept.",
+  "feedback.err.record": "Couldn't start recording",
+  "feedback.pill": "REC {elapsed} / {max}",
+  "feedback.pill.stop": "Stop & send",
+  "feedback.recovered.title": "Unsent recording",
+  "feedback.recovered.bodyCut":
+    "Your last recording was cut short when the app closed unexpectedly. Send it?",
+  "feedback.recovered.body": "You have a recording that was not sent yet. Send it?",
+  "feedback.recovered.confirm": "Review and send",
+  "feedback.recovered.discard": "Discard",
 } as const;
 
 export type StringKey = keyof typeof en;

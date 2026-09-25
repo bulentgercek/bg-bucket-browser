@@ -371,7 +371,7 @@ async fn ffmpeg_frame(input: &str) -> Option<Vec<u8>> {
 // ── Shared ─────────────────────────────────────────────────────────────
 
 fn remote_key(path: &str) -> String {
-    path.trim().trim_start_matches('/').to_string()
+    path.trim_start_matches('/').to_string()
 }
 
 fn mtime_ms(meta: &std::fs::Metadata) -> u128 {

@@ -11,7 +11,7 @@ import { persistStorage } from "../lib/persist";
 
 export type Screen = "main" | "settings";
 export type Theme = "dark" | "light" | "system";
-export type SettingsTab = "connections" | "appearance" | "about";
+export type SettingsTab = "connections" | "appearance" | "feedback" | "about";
 
 // Neither pane may shrink away completely.
 const MIN_SPLIT = 0.2;

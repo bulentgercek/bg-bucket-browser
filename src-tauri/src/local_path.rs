@@ -28,8 +28,9 @@ pub fn home() -> Result<PathBuf, HomeNotFound> {
 
 /// Resolves a pane path to a real one: `""` and `"~"` are the home directory,
 /// `~/…` lies under it, and anything else is used as given.
+/// The path is not trimmed: a name ending in a space is a different file.
 pub fn resolve_local(path: &str) -> Result<PathBuf, HomeNotFound> {
-    let p = path.trim();
+    let p = path;
     if p.is_empty() || p == "~" {
         return home();
     }
@@ -46,7 +47,7 @@ mod tests {
     #[test]
     fn empty_and_tilde_are_home() {
         let h = home().unwrap();
-        for p in ["", "~", " ", " ~ "] {
+        for p in ["", "~"] {
             assert_eq!(resolve_local(p).unwrap(), h, "{p:?}");
         }
     }

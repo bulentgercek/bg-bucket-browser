@@ -147,6 +147,48 @@ function patchActiveTab(
   return index === 0 ? [nextPane, panes[1]] : [panes[0], nextPane];
 }
 
+/** Patches one tab by id; a tab closed in the meantime is left alone. */
+function patchTab(
+  panes: Panes,
+  index: PaneIndex,
+  tabId: string,
+  patch: (tab: TabState) => TabState,
+): Panes {
+  const pane = panes[index];
+  if (!pane.tabs.some((tb) => tb.id === tabId)) return panes;
+  const tabs = pane.tabs.map((tb) => (tb.id === tabId ? patch(tb) : tb));
+  const nextPane: PaneState = { ...pane, tabs };
+  return index === 0 ? [nextPane, panes[1]] : [panes[0], nextPane];
+}
+
+/** The newest listing request of each tab. A reply that is not the newest one
+    is dropped: the user has moved on, in that tab or to another. */
+const latestRequest = new Map<string, number>();
+let requestCounter = 0;
+function beginRequest(tabId: string): () => boolean {
+  const n = ++requestCounter;
+  latestRequest.set(tabId, n);
+  return () => latestRequest.get(tabId) === n;
+}
+
+/** Keeps only the selected entries that are on screen. What is selected is
+    what an action takes, so an entry the filter or the hidden-files setting
+    has taken out of view leaves the selection too. */
+function keepVisibleSelection(
+  tab: TabState,
+  filter: string,
+  showHidden: boolean,
+): TabState {
+  const visible = new Set(
+    visibleEntries(tab.listing, filter, showHidden).map((e) => e.name),
+  );
+  const selection = tab.selection.filter((n) => visible.has(n));
+  const anchor = tab.anchor && visible.has(tab.anchor) ? tab.anchor : null;
+  return selection.length === tab.selection.length && anchor === tab.anchor
+    ? tab
+    : { ...tab, selection, anchor };
+}
+
 /** Joins a name onto a path, whichever root that path has. */
 export function childPath(path: string, name: string): string {
   if (path === "/") return `/${name}`; // the absolute root must not be trimmed away
@@ -180,13 +222,14 @@ function errKind(e: unknown): ListErrKind {
 // ── Store ──────────────────────────────────────────────────────────
 interface PaneStore {
   panes: Panes;
-  /** Goes to a path in the active tab. */
-  navigate: (index: PaneIndex, path: string) => Promise<void>;
+  /** Goes to a path in the active tab, or in the given one. The listing lands
+      in the tab it was asked for, even if another one is in view by then. */
+  navigate: (index: PaneIndex, path: string, tabId?: string) => Promise<void>;
   /** Lists the same folder again without disturbing anything: no loading
       flash, and the cursor, selection, scroll, filter and sorting all survive.
       The cursor follows its entry by name, so it stays on the same file even if
       the order changed. */
-  refresh: (index: PaneIndex) => Promise<void>;
+  refresh: (index: PaneIndex, tabId?: string) => Promise<void>;
   /** Goes up one level; at a root, nothing happens. */
   goParent: (index: PaneIndex) => Promise<void>;
   /** Opens an entry: a folder in the pane, a local file in its default
@@ -310,13 +353,15 @@ export const usePaneStore = create<PaneStore>()(
 persist((set, get) => ({
   panes: [freshPane("remote", ""), freshPane("local", "~")],
 
-  navigate: async (index, path) => {
+  navigate: async (index, path, tabId) => {
     // The loading state is written before anything is awaited, so a second
     // call arriving immediately sees it and does not fetch the same folder
     // twice.
     const side = get().panes[index].side;
+    const id = tabId ?? get().panes[index].activeTabId;
+    const isLatest = beginRequest(id);
     set({
-      panes: patchActiveTab(get().panes, index, (tb) => ({
+      panes: patchTab(get().panes, index, id, (tb) => ({
         ...tb,
         status: "loading",
         error: null,
@@ -328,6 +373,7 @@ persist((set, get) => ({
     try {
       const listing =
         side === "remote" ? await listRemote(path) : await listLocal(path);
+      if (!isLatest()) return;
       // Only a folder that actually opened is worth remembering.
       useRecentStore.getState().visit(side, path);
       // Each connection remembers where it was left, so switching back returns
@@ -338,7 +384,7 @@ persist((set, get) => ({
           .record(useConnectionStore.getState().activeId, path);
       }
       set({
-        panes: patchActiveTab(get().panes, index, (tb) => ({
+        panes: patchTab(get().panes, index, id, (tb) => ({
           ...tb,
           path,
           listing,
@@ -353,8 +399,9 @@ persist((set, get) => ({
         })),
       });
     } catch (e) {
+      if (!isLatest()) return;
       set({
-        panes: patchActiveTab(get().panes, index, (tb) => ({
+        panes: patchTab(get().panes, index, id, (tb) => ({
           ...tb,
           // The path that failed is still the path this tab is on. Keeping the
           // previous one draws a breadcrumb of a folder nobody asked for.
@@ -371,10 +418,11 @@ persist((set, get) => ({
     }
   },
 
-  refresh: async (index) => {
+  refresh: async (index, tabId) => {
     const pane = get().panes[index];
-    const tab = pane.tabs.find((tb) => tb.id === pane.activeTabId);
+    const tab = pane.tabs.find((tb) => tb.id === (tabId ?? pane.activeTabId));
     if (!tab || tab.status === "loading") return; // a fetch is already out
+    const isLatest = beginRequest(tab.id);
     const side = pane.side;
     const showHidden = useUiStore.getState().showHidden;
 
@@ -394,6 +442,7 @@ persist((set, get) => ({
         side === "remote"
           ? await listRemote(tab.path)
           : await listLocal(tab.path);
+      if (!isLatest()) return;
       const names = sortEntries(
         visibleEntries(listing, tab.filter, showHidden),
         tab.sort,
@@ -412,7 +461,7 @@ persist((set, get) => ({
       }
 
       set({
-        panes: patchActiveTab(get().panes, index, (t) => ({
+        panes: patchTab(get().panes, index, tab.id, (t) => ({
           ...t,
           listing,
           selection: selBefore.filter((n) => names.includes(n)),
@@ -424,8 +473,9 @@ persist((set, get) => ({
         })),
       });
     } catch (e) {
+      if (!isLatest()) return;
       set({
-        panes: patchActiveTab(get().panes, index, (t) => ({
+        panes: patchTab(get().panes, index, tab.id, (t) => ({
           ...t,
           status: "error",
           error: errKind(e),
@@ -604,11 +654,11 @@ persist((set, get) => ({
   },
 
   setFilter: (index, value) => {
+    const showHidden = useUiStore.getState().showHidden;
     set({
-      panes: patchActiveTab(get().panes, index, (tb) => ({
-        ...tb,
-        filter: value,
-      })),
+      panes: patchActiveTab(get().panes, index, (tb) =>
+        keepVisibleSelection({ ...tb, filter: value }, value, showHidden),
+      ),
     });
   },
 
@@ -659,3 +709,51 @@ persist((set, get) => ({
   }),
   merge: (persisted, current) => mergePanes(persisted, current as PaneStore),
 }));
+
+/** The volume the remote pane is reading: the live connection and where it points. */
+function liveVolume(s: ReturnType<typeof useConnectionStore.getState>): string {
+  const c = s.connections.find((x) => x.id === s.activeId);
+  return c ? `${c.id}\n${c.endpoint}\n${c.region}\n${c.bucket}` : `${s.activeId}`;
+}
+
+// When the live volume changes, the remote tabs out of view drop their listing
+// and fetch a fresh one when entered. The tab in view is listed again by
+// whoever made the change. A listing kept from the old volume would show its
+// files while delete and rename act on the new one.
+useConnectionStore.subscribe((s, prev) => {
+  if (!prev.loaded || liveVolume(s) === liveVolume(prev)) return;
+  usePaneStore.setState((st) => ({
+    panes: st.panes.map((pane) =>
+      pane.side !== "remote"
+        ? pane
+        : {
+            ...pane,
+            tabs: pane.tabs.map((tb) =>
+              tb.id === pane.activeTabId
+                ? tb
+                : {
+                    ...tb,
+                    listing: [],
+                    selection: [],
+                    anchor: null,
+                    cursorIndex: -1,
+                    renaming: null,
+                    status: "idle" as const,
+                    error: null,
+                  },
+            ),
+          },
+    ) as Panes,
+  }));
+});
+
+// Hiding dotfiles takes them out of every tab's selection, as the filter does.
+useUiStore.subscribe((s, prev) => {
+  if (s.showHidden || !prev.showHidden) return;
+  usePaneStore.setState((st) => ({
+    panes: st.panes.map((pane) => ({
+      ...pane,
+      tabs: pane.tabs.map((tb) => keepVisibleSelection(tb, tb.filter, false)),
+    })) as Panes,
+  }));
+});

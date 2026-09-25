@@ -63,6 +63,7 @@ export default function Dialog() {
       if (e.key === "Enter") {
         e.preventDefault();
         if (choiceRef.current === "confirm") dialog.onConfirm();
+        else dialog.onCancel?.();
         close();
       }
     };
@@ -202,7 +203,10 @@ export default function Dialog() {
                 type="button"
                 className={`btn btn-choice${choice === "cancel" ? " btn-selected" : ""}`}
                 onFocus={() => setChoice("cancel")}
-                onClick={close}
+                onClick={() => {
+                  dialog.onCancel?.();
+                  close();
+                }}
               >
                 {dialog.cancelLabel ?? t("dialog.cancel")}
               </button>

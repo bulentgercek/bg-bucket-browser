@@ -393,6 +393,19 @@ export async function pasteIntoPane(
 
   const cb = useClipboardStore.getState().clipboard;
   if (cb) {
+    // A remote copy pastes only while its own volume is live; the same path on
+    // another volume is a different file. The clipboard is kept for the way back.
+    const active = useConnectionStore.getState();
+    if (cb.srcSide === "remote" && cb.connId !== active.activeId) {
+      const from = active.connections.find((c) => c.id === cb.connId);
+      useToastStore.getState().push(
+        t("clipboard.otherVolume", {
+          name: from?.name || from?.bucket || t("clipboard.unknownVolume"),
+        }),
+        "error",
+      );
+      return;
+    }
     void runTransfer({
       items: cb.items,
       srcSide: cb.srcSide,

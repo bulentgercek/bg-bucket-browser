@@ -91,8 +91,10 @@ impl From<HomeNotFound> for FsErr {
 }
 
 // A remote path as a prefix: the root stays empty, anything else gets one trailing slash.
+// Paths are never trimmed: a name may begin or end with a space, and trimming it
+// points at a different object.
 fn as_prefix(path: &str) -> String {
-    match path.trim().trim_matches('/') {
+    match path.trim_matches('/') {
         "" => String::new(),
         p => format!("{p}/"),
     }
@@ -103,9 +105,9 @@ fn as_prefix(path: &str) -> String {
 /// The UI never sends these; this is a second line of defence.
 pub fn ensure_not_root(remote: bool, path: &str) -> Result<(), String> {
     let refused = if remote {
-        path.trim().trim_matches('/').is_empty()
+        path.trim_matches('/').is_empty()
     } else {
-        let p = path.trim();
+        let p = path;
         if p.is_empty() || p == "~" || p == "~/" {
             true
         } else {
@@ -113,7 +115,11 @@ pub fn ensure_not_root(remote: bool, path: &str) -> Result<(), String> {
                 Ok(resolved) => {
                     let canon = |x: &std::path::Path| fs::canonicalize(x).unwrap_or_else(|_| x.to_path_buf());
                     let r = canon(&resolved);
-                    r.parent().is_none() || home().is_ok_and(|h| canon(&h) == r)
+                    // A pane path is always absolute or under `~`; anything else
+                    // would resolve against the working directory.
+                    !resolved.has_root()
+                        || r.parent().is_none()
+                        || home().is_ok_and(|h| canon(&h) == r)
                 }
                 Err(_) => true,
             }
@@ -128,15 +134,27 @@ pub fn ensure_not_root(remote: bool, path: &str) -> Result<(), String> {
 
 // A remote path as an object key.
 fn as_key(path: &str) -> String {
-    path.trim().trim_start_matches('/').to_string()
+    path.trim_start_matches('/').to_string()
 }
 
+// The copy's stored size is checked against the source before the source goes,
+// the same check every transfer write passes.
 async fn copy_then_delete(
     client: &Client,
     bucket: &str,
     old_key: &str,
     new_key: &str,
 ) -> Result<(), FsErr> {
+    let size = client
+        .head_object()
+        .bucket(bucket)
+        .key(old_key)
+        .send()
+        .await
+        .map_err(|e| FsErr::new(FsErrKind::S3, s3_detail(&e)))?
+        .content_length()
+        .unwrap_or(0)
+        .max(0) as u64;
     client
         .copy_object()
         .bucket(bucket)
@@ -145,6 +163,9 @@ async fn copy_then_delete(
         .send()
         .await
         .map_err(|e| FsErr::new(FsErrKind::S3, s3_detail(&e)))?;
+    crate::core::verify_object_size(client, bucket, new_key, size)
+        .await
+        .map_err(|e| FsErr::new(FsErrKind::S3, e))?;
     client
         .delete_object()
         .bucket(bucket)
@@ -696,17 +717,20 @@ mod root_path_tests {
 
     #[test]
     fn empty_remote_path_targets_whole_bucket() {
-        for p in ["", "/", " ", "//"] {
+        for p in ["", "/", "//"] {
             assert_eq!(as_prefix(p), "", "{p:?}");
         }
+        // A space is a name, not the root.
+        assert_eq!(as_prefix(" "), " /");
+        assert_eq!(as_prefix("models "), "models /");
     }
 
     #[test]
     fn guard_refuses_remote_root() {
-        for p in ["", "/", " ", "//"] {
+        for p in ["", "/", "//"] {
             assert!(super::ensure_not_root(true, p).is_err(), "{p:?}");
         }
-        for p in ["a", "/a/", "Tests/x.txt"] {
+        for p in ["a", "/a/", "Tests/x.txt", " ", "models "] {
             assert!(super::ensure_not_root(true, p).is_ok(), "{p:?}");
         }
     }
@@ -719,7 +743,7 @@ mod root_path_tests {
         for p in ["", " ", "~", "~/", "/", hs.as_str(), with_slash.as_str()] {
             assert!(super::ensure_not_root(false, p).is_err(), "{p:?}");
         }
-        for p in ["~/Downloads", "/tmp"] {
+        for p in ["~/Downloads", "/tmp", "~/keep "] {
             assert!(super::ensure_not_root(false, p).is_ok(), "{p:?}");
         }
     }
@@ -739,9 +763,10 @@ mod root_path_tests {
     #[test]
     fn empty_local_path_targets_home() {
         let h = home().unwrap();
-        for p in ["", "~", " "] {
+        for p in ["", "~"] {
             assert_eq!(resolve_local(p).unwrap(), h, "{p:?}");
         }
+        assert_eq!(resolve_local("~/keep ").unwrap(), h.join("keep "));
     }
 }
 
@@ -757,5 +782,66 @@ mod tests {
         for name in ["a", ".keep", "...", "a.b", "..a", "a..", "Memes & Shorts"] {
             assert!(check_name(name, "invalid name").is_ok(), "{name:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod rename_copy_tests {
+    // A stand-in server answers every request; the test checks that a copy
+    // stored with the wrong size is removed and the source is left alone.
+    use super::copy_then_delete;
+    use aws_sdk_s3::Client;
+    use aws_sdk_s3::primitives::SdkBody;
+    use aws_smithy_http_client::test_util::infallible_client_fn;
+    use std::sync::{Arc, Mutex};
+
+    /// A client whose server reports `copy_size` for the new key and records
+    /// every request as "METHOD path".
+    fn client_with_copy_size(copy_size: u64) -> (Client, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let http = infallible_client_fn(move |req: http::Request<SdkBody>| {
+            let path = req.uri().path().to_string();
+            log.lock().unwrap().push(format!("{} {path}", req.method()));
+            let resp = http::Response::builder();
+            match (req.method().as_str(), path.as_str()) {
+                ("HEAD", "/b/old.bin") => resp.status(200).header("content-length", "100"),
+                ("HEAD", "/b/new.bin") => {
+                    resp.status(200).header("content-length", copy_size.to_string())
+                }
+                ("PUT", _) => resp.status(200),
+                _ => resp.status(204),
+            }
+            .body(match req.method().as_str() {
+                "PUT" => SdkBody::from(
+                    "<CopyObjectResult><ETag>\"x\"</ETag></CopyObjectResult>",
+                ),
+                _ => SdkBody::empty(),
+            })
+            .unwrap()
+        });
+        let (client, _) = crate::core::s3_client_from_parts(
+            "https://gateway.test", "eu-ro-1", "b", "AKIDTEST", "not-a-secret",
+        );
+        let conf = client.config().to_builder().http_client(http).build();
+        (Client::from_conf(conf), seen)
+    }
+
+    #[tokio::test]
+    async fn wrong_size_copy_is_removed_and_the_source_kept() {
+        let (client, seen) = client_with_copy_size(50);
+        assert!(copy_then_delete(&client, "b", "old.bin", "new.bin").await.is_err());
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.contains(&"DELETE /b/new.bin".to_string()), "{seen:?}");
+        assert!(!seen.contains(&"DELETE /b/old.bin".to_string()), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn right_size_copy_deletes_the_source() {
+        let (client, seen) = client_with_copy_size(100);
+        copy_then_delete(&client, "b", "old.bin", "new.bin").await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.contains(&"DELETE /b/old.bin".to_string()), "{seen:?}");
+        assert!(!seen.contains(&"DELETE /b/new.bin".to_string()), "{seen:?}");
     }
 }

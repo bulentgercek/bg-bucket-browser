@@ -147,7 +147,7 @@ pub async fn list_remote(
         .map_err(|e| ListErr::new(ListErrKind::Unknown, e.to_string()))?;
 
     // The root is the empty prefix; anything else carries exactly one trailing slash.
-    let prefix = match path.trim().trim_matches('/') {
+    let prefix = match path.trim_matches('/') {
         "" => String::new(),
         p => format!("{p}/"),
     };

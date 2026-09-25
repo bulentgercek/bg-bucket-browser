@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { localHomeDir, readOsClipboardFiles, writeOsClipboardFiles } from "../lib/commands";
+import { useConnectionStore } from "./connectionStore";
 import { childPath, type Entry, type PaneSide } from "./paneStore";
 
 /* What Copy and Cut put down, from inside the app and from the rest of the
@@ -24,6 +25,9 @@ export interface Clipboard {
   srcPath: string;
   mode: "copy" | "move";
   origin: "inApp";
+  /** The connection a remote copy came from; filled in by `setClipboard`. A
+      remote path means nothing without its volume. */
+  connId?: string;
 }
 
 interface ClipboardState {
@@ -80,7 +84,11 @@ export const useClipboardStore = create<ClipboardState>((set, get) => ({
   ownOsSignature: null,
   // A copy made in the app takes the slot; the OS row goes.
   setClipboard: (c) => {
-    set({ clipboard: c, osClipboardTag: null });
+    const connId =
+      c.srcSide === "remote"
+        ? (useConnectionStore.getState().activeId ?? undefined)
+        : undefined;
+    set({ clipboard: { ...c, connId }, osClipboardTag: null });
     // Only a local copy goes out to the desktop, so it can be pasted in a file
     // manager. A remote object has no local path to offer.
     if (c.srcSide === "local") {

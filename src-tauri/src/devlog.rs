@@ -17,6 +17,13 @@
 //! Verbose is on by default in development builds and off otherwise.
 //! `BGBB_LOG=verbose` turns it on, `BGBB_LOG=quiet` turns it off.
 //!
+//! A third file, `recording.log`, exists only while the user records a problem
+//! for a feedback report (Settings → Feedback). For that time every verbose
+//! line is written there too, whatever the verbose setting is. It opens with
+//! `=== recording start ... ===` and closes with `=== recording end ... ===`;
+//! a missing end means the app went down while recording. It stays until the
+//! report is sent or discarded.
+//!
 //! Never pass credentials or keys to this module.
 
 use std::fmt::Display;
@@ -31,8 +38,15 @@ use tauri::{AppHandle, Manager};
 // Verbose rotates past this size; one backup is kept.
 const VERBOSE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
+// A recording stops by itself after this long, or past this size.
+pub const RECORDING_MAX_SECS: u64 = 5 * 60;
+const RECORDING_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const RECORDING_FILE: &str = "recording.log";
+
 // Checked on every verbose call without taking the lock.
 static VERBOSE_ON: AtomicBool = AtomicBool::new(false);
+// True while a feedback recording is capturing; verbose lines are then built even when the branch is off.
+static RECORDING_ON: AtomicBool = AtomicBool::new(false);
 // Set once at startup; until then every call is a no-op.
 static LOGGER: OnceLock<Mutex<Logger>> = OnceLock::new();
 
@@ -102,8 +116,10 @@ impl Sink {
 }
 
 struct Logger {
+    dir: PathBuf,
     toast: Sink,
     verbose: Option<Sink>,
+    recording: Option<(Sink, std::time::Instant)>,
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -176,12 +192,17 @@ fn init_in(dir: &Path, verbose: bool) {
     }
 
     VERBOSE_ON.store(verbose, Ordering::Relaxed);
-    let _ = LOGGER.set(Mutex::new(Logger { toast, verbose: verbose_sink }));
+    let _ = LOGGER.set(Mutex::new(Logger {
+        dir: dir.to_path_buf(),
+        toast,
+        verbose: verbose_sink,
+        recording: None,
+    }));
 }
 
 /// True when the verbose branch is recording. Check it before building costly messages.
 pub fn verbose_enabled() -> bool {
-    VERBOSE_ON.load(Ordering::Relaxed)
+    VERBOSE_ON.load(Ordering::Relaxed) || RECORDING_ON.load(Ordering::Relaxed)
 }
 
 fn with_logger(f: impl FnOnce(&mut Logger)) {
@@ -193,13 +214,92 @@ fn with_logger(f: impl FnOnce(&mut Logger)) {
 }
 
 fn write_verbose(l: &mut Logger, area: &str, msg: &str) {
+    let stamp = now_full();
+    let line = format!("[{area}] {}", one_line(msg));
     if let Some(v) = l.verbose.as_mut() {
         if v.bytes > VERBOSE_MAX_BYTES {
             v.flush_repeats();
             v.rotate();
         }
-        v.write(&now_full(), &format!("[{area}] {}", one_line(msg)));
+        v.write(&stamp, &line);
     }
+    let over = match l.recording.as_mut() {
+        Some((r, started)) => {
+            r.write(&stamp, &line);
+            started.elapsed().as_secs() >= RECORDING_MAX_SECS || r.bytes > RECORDING_MAX_BYTES
+        }
+        None => false,
+    };
+    if over {
+        end_recording(l);
+    }
+}
+
+fn recording_path(l: &Logger) -> PathBuf {
+    l.dir.join(RECORDING_FILE)
+}
+
+fn end_recording(l: &mut Logger) {
+    if let Some((mut r, _)) = l.recording.take() {
+        r.flush_repeats();
+        r.raw(&format!("=== recording end {} ===\n", now_full()));
+    }
+    RECORDING_ON.store(false, Ordering::Relaxed);
+}
+
+/// Starts a feedback recording, replacing any earlier one that was not sent.
+pub fn recording_start() -> Result<(), String> {
+    let mut result = Err("the log is not available".to_string());
+    with_logger(|l| {
+        end_recording(l);
+        let path = recording_path(l);
+        let _ = fs::remove_file(&path);
+        let mut sink = Sink::open(path);
+        if sink.file.is_none() {
+            result = Err("could not open the recording file".into());
+            return;
+        }
+        sink.raw(&format!(
+            "=== recording start {} v{} {} ===\n",
+            now_full(),
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+        ));
+        l.recording = Some((sink, std::time::Instant::now()));
+        RECORDING_ON.store(true, Ordering::Relaxed);
+        result = Ok(());
+    });
+    result
+}
+
+/// Ends the running recording, if any. The file stays until it is sent or discarded.
+pub fn recording_stop() {
+    with_logger(end_recording);
+}
+
+/// True while a recording is capturing.
+pub fn recording_active() -> bool {
+    RECORDING_ON.load(Ordering::Relaxed)
+}
+
+/// The recording file's contents, running, finished or cut short; `None` when there is none.
+pub fn recording_text() -> Option<String> {
+    let mut out = None;
+    with_logger(|l| {
+        if let Some((r, _)) = l.recording.as_mut() {
+            r.flush_repeats();
+        }
+        out = fs::read_to_string(recording_path(l)).ok();
+    });
+    out
+}
+
+/// Deletes the recording, ending it first if it is still running.
+pub fn recording_discard() {
+    with_logger(|l| {
+        end_recording(l);
+        let _ = fs::remove_file(recording_path(l));
+    });
 }
 
 /// Records a notification shown to the user.
@@ -230,6 +330,9 @@ pub fn flush() {
             v.flush_repeats();
             v.raw(&footer);
         }
+        // Closing the app while recording ends the recording normally; it is
+        // offered for sending on the next start.
+        end_recording(l);
     });
 }
 

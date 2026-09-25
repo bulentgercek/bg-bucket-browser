@@ -10,7 +10,13 @@ import { invoke as rawInvoke, type InvokeArgs } from "@tauri-apps/api/core";
    records what was requested and how it ended (`devlog.rs`). */
 
 /** Commands whose arguments are never logged (they carry credentials). */
-const LOG_NO_ARGS = new Set(["test_connection", "save_connection", "set_runpod_api_key"]);
+const LOG_NO_ARGS = new Set([
+  "test_connection",
+  "save_connection",
+  "set_runpod_api_key",
+  // The user's own words and address stay out of the log.
+  "feedback_send",
+]);
 
 /** High-frequency commands: logged only when they fail. */
 const LOG_ERRORS_ONLY = new Set([
@@ -387,6 +393,51 @@ export interface VolumeQuota {
 }
 export function volumeQuota(): Promise<VolumeQuota> {
   return invoke<VolumeQuota>("volume_quota");
+}
+
+/** A feedback recording, as the Feedback screen shows it (`feedback.rs`). */
+export interface RecordingInfo {
+  text: string;
+  /** Log lines, not counting the start and end markers. */
+  lines: number;
+  durationSec: number;
+  /** Still capturing. */
+  active: boolean;
+  /** The app went down while recording. */
+  cutShort: boolean;
+}
+
+/** Why a report was not accepted. */
+export interface FeedbackErr {
+  kind: "invalid" | "tooLarge" | "rateLimited" | "server" | "network";
+  /** For `invalid`: the field the service rejected, when it names one. */
+  field?: string;
+}
+
+export function feedbackRecordStart(): Promise<void> {
+  return invoke("feedback_record_start");
+}
+export function feedbackRecordStop(): Promise<RecordingInfo | null> {
+  return invoke<RecordingInfo | null>("feedback_record_stop");
+}
+/** The recording waiting to be sent: running, finished or cut short. */
+export function feedbackRecording(): Promise<RecordingInfo | null> {
+  return invoke<RecordingInfo | null>("feedback_recording");
+}
+export function feedbackDiscardRecording(): Promise<void> {
+  return invoke("feedback_discard_recording");
+}
+/** Whether reports go to the service's test channel (development builds). */
+export function feedbackIsTest(): Promise<boolean> {
+  return invoke<boolean>("feedback_is_test");
+}
+/** Sends a report; resolves to the service's reference for it. */
+export function feedbackSend(
+  message: string,
+  contact: string,
+  withRecording: boolean,
+): Promise<string> {
+  return invoke<string>("feedback_send", { message, contact, withRecording });
 }
 
 /** Whether the file manager entry is registered. Each platform registers it

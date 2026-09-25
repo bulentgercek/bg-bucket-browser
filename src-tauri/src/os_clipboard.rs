@@ -211,7 +211,7 @@ fn read_os_clipboard_files_sync() -> OsClipboardState {
 
 // Expands `~` against the home directory; other paths are used as given.
 fn resolve_home(path: &str) -> PathBuf {
-    let p = path.trim();
+    let p = path;
     let home = || std::env::home_dir().unwrap_or_default();
     if p.is_empty() || p == "~" {
         return home();

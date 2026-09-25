@@ -8,9 +8,11 @@ import { formatSize } from "../../lib/format";
 import { t } from "../../locale/en";
 import TransfersIndicator from "./TransfersIndicator";
 import ClipboardIndicator from "./ClipboardIndicator";
+import RecordingIndicator from "./RecordingIndicator";
 
 /* The bar along the bottom: what is selected on the left, the transfer and
-   clipboard indicators in the middle, and how much room is left on the right.
+   clipboard indicators in the middle (and a feedback recording, while one
+   runs), and how much room is left on the right.
 
    The two indicators are separate components that share nothing but which
    popup is open. */
@@ -105,6 +107,7 @@ export default function StatusBar() {
       </span>
 
       <div className="flex items-center justify-center gap-2">
+        <RecordingIndicator />
         <TransfersIndicator />
         <ClipboardIndicator />
       </div>

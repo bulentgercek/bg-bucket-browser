@@ -161,7 +161,9 @@ export default function Panel({ index }: { index: PaneIndex }) {
     return otherOnLeft ? "left" : "right";
   };
 
-  const reload = () => void navigate(index, tab.path);
+  // The tab that started the action is the one listed again, even if the user
+  // has switched tabs while it ran.
+  const reload = () => void navigate(index, tab.path, tab.id);
 
   // What the pane shows instead of a list, and what can be done from there.
   const stateOpts = {
