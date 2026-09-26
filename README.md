@@ -203,6 +203,16 @@ hot-reload.
 
 Toolchain used during development: Rust 1.98, Node.js 26.
 
+### Tests
+
+```
+npm test
+cd src-tauri && cargo test
+```
+
+Neither needs network access or credentials: S3 requests are intercepted and
+Tauri commands are mocked.
+
 ### Debug logging
 
 The application keeps a development log of its own, in two files, wherever the
@@ -253,7 +263,8 @@ the frontend does not need to know which OS it is running on.
 ## Support
 
 If the application is useful to you, you can support its development through
-[GitHub Sponsors](https://github.com/sponsors/bulentgercek).
+[GitHub Sponsors](https://github.com/sponsors/bulentgercek). Sponsorship would
+go first toward code signing for the macOS and Windows packages.
 
 ## License
 
