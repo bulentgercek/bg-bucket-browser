@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.1 - 2026-09-26
+
+Security update. Released under the Apache License 2.0, as before.
+
+- Updated rustls, the TLS library behind every HTTPS connection the app
+  makes (to your volumes, the RunPod API and the feedback service), from
+  0.23.44 to 0.23.45. The new version fixes RUSTSEC-2026-0285
+  (GHSA-2mjx-qc3c-rqvc): during a TLS 1.3 handshake, some messages were
+  accepted at the wrong encryption level. The handshake stayed
+  authenticated, so an attacker on the network could not alter or complete
+  it. Updating is recommended.
+- The repository now has a security policy: `SECURITY.md` explains how to
+  report a vulnerability privately.
+
+There are no other changes.
+
 ## 1.1.0 - 2026-09-25
 
 Data-safety fixes and in-app feedback. Released under the Apache License 2.0,
