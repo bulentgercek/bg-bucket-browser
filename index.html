@@ -4,8 +4,22 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>BG Bucket Browser</title>
+    <!-- The theme the app last showed, set before anything is painted so the
+         splash below is already in it. The app keeps it up to date. -->
+    <script>
+      try {
+        var theme = localStorage.getItem("bgbb-theme");
+        if (theme === "light" || theme === "dark") {
+          document.documentElement.dataset.theme = theme;
+        }
+      } catch (e) {}
+    </script>
     <!-- The window's own background, before any stylesheet has loaded: a
-         webview starts out white, and the flash is visible at every launch. -->
+         webview starts out white, and the flash is visible at every launch.
+         Until the app draws its first frame, the window shows the splash: the
+         logo on the remote pane's glow, since an empty window looks like a
+         crash. Its sizes follow the window, not CSS pixels, so it does not
+         jump when the saved font size zooms the page. -->
     <style>
       html,
       body,
@@ -14,10 +28,49 @@
         margin: 0;
         background: #161826;
       }
+      html[data-theme="light"],
+      html[data-theme="light"] body,
+      html[data-theme="light"] #root {
+        background: #f5f6fa;
+      }
+      .splash {
+        display: flex;
+        height: 100%;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(to top, rgba(145, 132, 217, 0.13), transparent 55%);
+      }
+      html[data-theme="light"] .splash {
+        background: linear-gradient(to top, rgba(111, 97, 201, 0.18), transparent 55%);
+      }
+      .splash svg {
+        width: 12vmin;
+        height: 12vmin;
+      }
     </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="splash" aria-hidden="true">
+        <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="splash-ground" x1="0.33" y1="0" x2="0.67" y2="1">
+              <stop offset="0" stop-color="#1b1d2c" />
+              <stop offset="1" stop-color="#161826" />
+            </linearGradient>
+            <clipPath id="splash-tile">
+              <rect width="64" height="64" rx="14" />
+            </clipPath>
+          </defs>
+          <g clip-path="url(#splash-tile)">
+            <rect width="64" height="64" fill="url(#splash-ground)" />
+            <rect x="3.5" y="5" width="22" height="54" rx="7" fill="none" stroke="#9184d9" stroke-width="6.5" />
+            <rect x="38.5" y="5" width="22" height="54" rx="7" fill="none" stroke="#9184d9" stroke-width="6.5" />
+            <circle cx="32" cy="32" r="13.2" fill="#d9c184" stroke="#161826" stroke-width="6.5" />
+          </g>
+        </svg>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -1,6 +1,5 @@
 import {
   useEffect,
-  useRef,
   useState,
   type DragEvent as ReactDragEvent,
 } from "react";
@@ -21,6 +20,18 @@ import { useContextMenu } from "../../state/contextMenuStore";
 import { t } from "../../locale/en";
 import { type RowDnd } from "./rowDnd";
 import { iconsDragImage } from "./IconsView";
+
+/* The element a drag last entered, anywhere in the window. Leaving an element
+   is reported on its own; this says where the pointer went. When it leaves the
+   window nothing new is entered, and this is still the element being left. */
+let dragEntered: EventTarget | null = null;
+window.addEventListener(
+  "dragenter",
+  (e) => {
+    dragEntered = e.target;
+  },
+  true,
+);
 
 /* Dragging entries within the app, and the highlights for drags from anywhere.
 
@@ -49,7 +60,7 @@ export function usePaneDnd({
   showBodyFrame: boolean;
   osBodyFrame: boolean;
   onBodyDragOver: (e: ReactDragEvent) => void;
-  onBodyDragLeave: () => void;
+  onBodyDragLeave: (e: ReactDragEvent) => void;
   onBodyDrop: (e: ReactDragEvent) => void;
 } {
   const setSelection = usePaneStore((s) => s.setSelection);
@@ -96,16 +107,6 @@ export function usePaneDnd({
     const id = window.setTimeout(() => setOsBodyFrame(osBodyFrameWanted), 55);
     return () => clearTimeout(id);
   }, [osBodyFrameWanted]);
-  // Leaving the pane clears the highlight after a moment, and any further
-  // movement inside cancels that — which is what tells a real exit from the gap
-  // between two rows.
-  const dragLeaveTimer = useRef<number | null>(null);
-  const cancelDragLeave = () => {
-    if (dragLeaveTimer.current !== null) {
-      clearTimeout(dragLeaveTimer.current);
-      dragLeaveTimer.current = null;
-    }
-  };
 
   const dndDestLabel = (p: string) =>
     remote ? (p ? `${bucket}/${p}` : bucket) : p || "~";
@@ -189,7 +190,6 @@ export function usePaneDnd({
       if (!st.payload) return;
       e.preventDefault();
       e.stopPropagation(); // the row is the target, not the pane behind it
-      cancelDragLeave();
       e.dataTransfer.dropEffect = "move"; // a neutral cursor: the choice comes later
       const dp = childPath(tab.path, entry.name);
       st.update({
@@ -217,7 +217,6 @@ export function usePaneDnd({
     const st = useDragStore.getState();
     if (!st.payload) return;
     e.preventDefault();
-    cancelDragLeave();
     e.dataTransfer.dropEffect = "move"; // a neutral cursor: the choice comes later
     st.update({
       cursor: { x: e.clientX, y: e.clientY },
@@ -226,23 +225,28 @@ export function usePaneDnd({
       overFolder: null,
     });
   };
-  const onBodyDragLeave = () => {
-    // What the pointer moved onto is not reported here, so leaving cannot be
-    // told from crossing a gap directly. Clearing is delayed instead, and any
-    // movement still inside the pane cancels it.
-    cancelDragLeave();
-    dragLeaveTimer.current = window.setTimeout(() => {
-      dragLeaveTimer.current = null;
-      useDragStore
-        .getState()
-        .update({ overSide: null, overFolder: null, dest: null });
-    }, 140);
+  const onBodyDragLeave = (e: ReactDragEvent) => {
+    // Moving from one row to the next, or onto the gap between two, is
+    // reported as leaving too. It counts only when the pointer has gone out of
+    // the pane: into something outside it, or out of the window.
+    const into = dragEntered;
+    if (
+      into instanceof Node &&
+      into !== e.target &&
+      e.currentTarget.contains(into)
+    ) {
+      return;
+    }
+    // By now the pointer may be over the other pane, which took the drag as
+    // it entered; only this pane's own target is cleared.
+    const st = useDragStore.getState();
+    if (st.overSide !== pane.side) return;
+    st.update({ overSide: null, overFolder: null, dest: null });
   };
   const onBodyDrop = (e: ReactDragEvent) => {
     const d = useDragStore.getState();
     if (!d.payload) return;
     e.preventDefault();
-    cancelDragLeave();
     performDrop(d.payload, tab.path, e.clientX, e.clientY);
   };
 

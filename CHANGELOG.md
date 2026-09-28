@@ -1,5 +1,90 @@
 # Changelog
 
+## 1.2.0 - 2026-09-28
+
+Security hardening after an independent review of the 1.1.0 source code, and
+a round of interface improvements. Released under the Apache License 2.0, as
+before.
+
+### Upgrading from 1.1.x
+
+- A connection whose endpoint uses plain `http://` now works only for
+  `localhost`, `127.0.0.1` and `[::1]`; any other address needs `https://`.
+  An existing connection of that kind stops with a message that points to
+  Settings. To reach a server without HTTPS, forward its port to `localhost`,
+  for example with an SSH tunnel.
+- An upload or a "Download as ZIP" left unfinished by 1.1.x starts again from
+  the beginning.
+
+### Security
+
+- Names that come from a volume are checked before anything is written
+  locally: a download, an opened file or a ZIP archive can no longer place a
+  file outside the folder you chose. On Windows, names the system cannot store
+  safely (such as `CON`, or names containing `\` or `:`) are refused.
+- Uploading or moving a local folder no longer follows symbolic links or
+  junctions inside it and skips names that are not valid UTF-8; what was
+  skipped is reported when the job ends. The app's own resume files are never
+  written through a link.
+- Saved keys are sent only to the endpoint they were saved for: changing a
+  connection's endpoint asks for its keys again, and Test uses only the keys in
+  the form. The RunPod API key can now be removed, and every removal from the
+  credential store is confirmed by reading it back.
+- A transfer stays on the connection it was started on, even if you switch
+  connections while it is being prepared. A connection's endpoint or bucket
+  cannot be changed while it has transfers queued or running.
+- The app no longer aborts unfinished uploads on the volume at startup, which
+  could include uploads made by other tools. They are listed in Settings (Scan
+  for interrupted uploads) and aborted only when you confirm.
+- Downloaded and opened files carry the operating system's "from the
+  internet" mark (Zone.Identifier on Windows, quarantine on macOS), so
+  SmartScreen and Gatekeeper check them as they would a browser download.
+- The macOS Finder service opens the app by its bundle identifier.
+- Copy, move, rename and Volume Cleanup are tied to the version of an object
+  they started from: an object that changes in the meantime is skipped and
+  reported, and a move deletes only the version it sent. RunPod honors these
+  conditions; some other S3 servers ignore them for deletes.
+- Upload resume is tied to the file itself: its size, modification time and
+  creation time. A file that changed is uploaded again from the start and its
+  earlier unfinished upload is removed from the volume; a move never deletes a
+  file that was replaced after it was sent.
+- "Download as ZIP" writes its archives itself. Archives larger than 4 GiB are
+  no longer damaged when a download resumes, as they were in 1.1.x, and
+  resuming checks each file's name, size and ETag.
+- Remote listings stop when you navigate away, and a folder listing stops at
+  one million objects (five million for a folder tree). Preparing a transfer
+  can be cancelled, closing Properties stops its size scan, and Volume Cleanup
+  keeps only what its report shows.
+- Server responses are read only up to the size expected, and thumbnail
+  generation is bounded: images above 100 megapixels are skipped.
+- The OS clipboard is read one request at a time, and on Wayland within a time
+  and size limit; a clipboard that cannot be read no longer clears an in-app
+  copy.
+
+### Interface
+
+- Four font sizes (Small, Medium, Large, Extra Large). Outside the panels,
+  Ctrl + / - and Ctrl + mouse wheel step through them (Cmd on macOS); inside a
+  panel they change its row and tile size.
+- Folders take their pane's color, lilac for a volume and amber for the local
+  disk, and icons are filled. Each pane shows its selection in its own color.
+- A startup screen shows the logo instead of an empty window, and the theme
+  and font size are in place from the first frame.
+- Large folders stay responsive: only the rows and tiles near the screen are
+  drawn, and switching the theme no longer blanks a long list for a moment.
+- The Icons view works with the keyboard like the Details view (arrows, Page
+  Up/Down, Shift + arrows to select), and a selected tile is clearly marked.
+- In a short window, Settings keeps its top bar in place; only the content
+  scrolls.
+
+### Fixes
+
+- On Windows, F5 and Ctrl+R no longer reload the whole interface while a
+  dialog or Settings is open.
+- The error notification of a job that fails at once now names its file.
+- Dragging quickly from one pane to the other and stopping no longer leaves
+  "Can't drop here" on screen.
+
 ## 1.1.1 - 2026-09-26
 
 Security update. Released under the Apache License 2.0, as before.

@@ -285,10 +285,52 @@ fn unescape_reserved_in_path(uri: &str) -> Option<String> {
 ///
 /// Only it needs the raw path: a standard S3 server decodes the escaped
 /// characters itself and refuses a signature made over the raw ones.
+// Only over https: the RunPod-specific request changes are not applied to plain http.
 fn is_runpod(endpoint: &str) -> bool {
-    let rest = endpoint.split_once("://").map_or(endpoint, |(_, r)| r);
-    let host = rest.split(['/', ':']).next().unwrap_or("").to_ascii_lowercase();
+    let lower = endpoint.trim().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
     host == "runpod.io" || host.ends_with(".runpod.io")
+}
+
+/// Why an endpoint may not carry credentials, or `None` when it may: it must be
+/// `https`, or plain `http` to this machine only (a local test server), with no
+/// user name or password inside the address. The code is what Settings shows.
+pub fn endpoint_problem(endpoint: &str) -> Option<&'static str> {
+    let e = endpoint.trim();
+    let lower = e.to_ascii_lowercase();
+    let (secure, rest) = if let Some(r) = lower.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = lower.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return Some("badEndpoint");
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // A query or a fragment has no place in an endpoint, and a fragment would
+    // hide a different host from a reader of the address.
+    if authority.is_empty()
+        || authority.contains('@')
+        || e.contains(char::is_whitespace)
+        || e.contains(['?', '#'])
+    {
+        return Some("badEndpoint");
+    }
+    if secure {
+        return None;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    if matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        None
+    } else {
+        Some("insecureEndpoint")
+    }
 }
 
 /// Builds a client for the RunPod gateway from credentials given directly.
@@ -333,6 +375,85 @@ pub fn s3_client_from_parts(
     }
 
     (Client::from_conf(config.build()), bucket.to_string())
+}
+
+/// Most entries one remote folder's listing may hold.
+pub const DIR_MAX_ENTRIES: u64 = 1_000_000;
+
+/// Most entries a listing of everything under a prefix may hold (a folder
+/// transfer, a rename, a delete).
+pub const TREE_MAX_ENTRIES: u64 = 5_000_000;
+
+/// Guards a listing that follows continuation tokens. A token that comes round
+/// again means the server is going in circles, and too many entries means a
+/// listing nothing can use; either ends the listing with an error instead of
+/// letting it run on or fill memory.
+///
+/// The SDK's paginator catches only a token repeated twice in a row.
+pub struct PageGuard {
+    /// Hashes of the tokens seen, so a long token costs no more than a short one.
+    seen: std::collections::HashSet<u64>,
+    /// The hash of the last token: the same token twice in a row is where the
+    /// SDK's paginator itself ends the listing, without an error.
+    last: Option<u64>,
+    items: u64,
+    max_items: u64,
+}
+
+impl PageGuard {
+    pub fn new(max_items: u64) -> Self {
+        PageGuard { seen: Default::default(), last: None, items: 0, max_items }
+    }
+
+    /// Counts a page just read: its entries and the token it points on with.
+    pub fn page(&mut self, items: usize, next: Option<&str>) -> Result<(), PageStop> {
+        use std::hash::{Hash, Hasher};
+        self.items += items as u64;
+        if self.items > self.max_items {
+            return Err(PageStop::TooMany(self.max_items));
+        }
+        if let Some(token) = next.filter(|t| !t.is_empty()) {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            token.hash(&mut h);
+            let h = h.finish();
+            if self.last != Some(h) && !self.seen.insert(h) {
+                return Err(PageStop::Loop);
+            }
+            self.last = Some(h);
+        }
+        Ok(())
+    }
+}
+
+/// Why a guarded listing stopped.
+#[derive(Debug, PartialEq)]
+pub enum PageStop {
+    /// More entries than the listing may hold.
+    TooMany(u64),
+    /// A page token came round again.
+    Loop,
+}
+
+impl std::fmt::Display for PageStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PageStop::TooMany(max) => write!(f, "the listing has more than {max} entries"),
+            PageStop::Loop => f.write_str("the server sent a page token it had sent before"),
+        }
+    }
+}
+
+/// Reads a response body into memory, refusing one longer than `cap` bytes: the
+/// server decides how much it sends, so the reader decides how much it keeps.
+pub async fn read_capped(mut body: ByteStream, cap: u64) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    while let Some(chunk) = body.try_next().await.map_err(|e| e.to_string())? {
+        if (out.len() + chunk.len()) as u64 > cap {
+            return Err(format!("the response is longer than the {cap} bytes expected"));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// Turns an SDK error into a line worth reading: the gateway's own code and
@@ -579,12 +700,108 @@ mod interceptor_tests {
     }
 
     #[test]
-    fn only_runpod_hosts_count_as_runpod() {
-        for yes in [RUNPOD, "https://S3API-EU-RO-1.RUNPOD.IO/", "http://runpod.io:443"] {
+    fn only_runpod_hosts_over_https_count_as_runpod() {
+        for yes in [RUNPOD, "https://S3API-EU-RO-1.RUNPOD.IO/"] {
             assert!(is_runpod(yes), "{yes}");
         }
-        for no in ["http://127.0.0.1:9000", "https://runpod.io.example.test", "https://notrunpod.io", ""] {
+        for no in [
+            "http://127.0.0.1:9000",
+            "https://runpod.io.example.test",
+            "https://notrunpod.io",
+            "",
+            "http://runpod.io:443",
+            "http://s3api-eu-ro-1.runpod.io",
+            "https://evil.example#.runpod.io",
+            "https://evil.example?.runpod.io",
+        ] {
             assert!(!is_runpod(no), "{no}");
         }
+    }
+
+    #[test]
+    fn credentials_go_only_over_https_or_to_this_machine() {
+        for ok in [
+            RUNPOD,
+            "https://s3.example.com:8443/base",
+            "HTTPS://S3.EXAMPLE.COM",
+            "http://localhost:9000",
+            "http://127.0.0.1:19000",
+            "http://[::1]:9000",
+            "  https://s3.example.com  ",
+        ] {
+            assert_eq!(endpoint_problem(ok), None, "{ok}");
+        }
+        for insecure in [
+            "http://s3.example.com",
+            "http://192.168.122.1:9000",
+            "http://localhost.example.com:9000",
+            "http://127.0.0.1.nip.io",
+            "http://0x7f000001",
+        ] {
+            assert_eq!(endpoint_problem(insecure), Some("insecureEndpoint"), "{insecure}");
+        }
+        for bad in [
+            "",
+            "s3.example.com",
+            "ftp://s3.example.com",
+            "https://",
+            "https://user:pass@s3.example.com",
+            "http://127.0.0.1@evil.example",
+            "https://s3 example.com",
+            "https://evil.example#.runpod.io",
+            "https://s3.example.com/?x=1",
+        ] {
+            assert_eq!(endpoint_problem(bad), Some("badEndpoint"), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod capped_tests {
+    use super::read_capped;
+    use aws_sdk_s3::primitives::ByteStream;
+
+    #[tokio::test]
+    async fn a_body_longer_than_expected_is_refused() {
+        let body = ByteStream::from(vec![7u8; 10]);
+        assert_eq!(read_capped(body, 10).await.unwrap().len(), 10);
+        let body = ByteStream::from(vec![7u8; 11]);
+        assert!(read_capped(body, 10).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod page_guard_tests {
+    use super::PageGuard;
+
+    #[test]
+    fn a_token_that_comes_round_again_ends_the_listing() {
+        let mut guard = PageGuard::new(u64::MAX);
+        assert!(guard.page(1000, Some("A")).is_ok());
+        assert!(guard.page(1000, Some("B")).is_ok());
+        assert!(guard.page(1000, Some("A")).is_err(), "A came round again");
+    }
+
+    // The paginator ends a listing on the same token twice in a row by itself.
+    #[test]
+    fn a_token_repeated_at_once_is_left_to_the_paginator() {
+        let mut guard = PageGuard::new(u64::MAX);
+        assert!(guard.page(1000, Some("A")).is_ok());
+        assert!(guard.page(1000, Some("A")).is_ok());
+    }
+
+    #[test]
+    fn a_listing_stops_past_its_entry_budget() {
+        let mut guard = PageGuard::new(2500);
+        assert!(guard.page(1000, Some("1")).is_ok());
+        assert!(guard.page(1000, Some("2")).is_ok());
+        assert!(guard.page(1000, None).is_err(), "3000 entries are over 2500");
+    }
+
+    #[test]
+    fn an_empty_token_is_no_token() {
+        let mut guard = PageGuard::new(10);
+        assert!(guard.page(3, Some("")).is_ok());
+        assert!(guard.page(3, Some("")).is_ok());
     }
 }

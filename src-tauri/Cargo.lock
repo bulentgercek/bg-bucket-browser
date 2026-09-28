@@ -693,7 +693,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bg-bucket-browser"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "arboard",
  "aws-runtime",
@@ -701,10 +701,12 @@ dependencies = [
  "aws-smithy-http-client",
  "base64 0.22.1",
  "chrono",
+ "crc32fast",
  "drag",
  "http 1.5.0",
  "image",
  "keyring",
+ "libc",
  "md-5 0.10.6",
  "opener",
  "percent-encoding",

@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { type Entry } from "../../state/paneStore";
-import { folderSize } from "../../lib/commands";
+import { cancelFolderSize, folderSize } from "../../lib/commands";
 import { formatDate, formatSize } from "../../lib/format";
 import { t } from "../../locale/en";
 
 /* What the Properties window shows. A folder's size has to be scanned, so the
    window opens immediately and fills that line in when it can. */
+
+
 export function PropertiesContent({
   entry,
   full,
@@ -25,11 +27,20 @@ export function PropertiesContent({
   useEffect(() => {
     if (!isDir) return;
     let alive = true;
-    folderSize(remote, full)
+    let running = true;
+    // A random id: a counter would restart after a reload while an old scan
+    // still runs under the same number.
+    const id = crypto.randomUUID();
+    folderSize(remote, full, id)
       .then((r) => alive && setScan(r))
-      .catch(() => alive && setScan("error"));
+      .catch(() => alive && setScan("error"))
+      .finally(() => {
+        running = false;
+      });
     return () => {
       alive = false;
+      // A closed window stops its scan rather than letting it page on.
+      if (running) void cancelFolderSize(id);
     };
   }, [isDir, remote, full]);
 

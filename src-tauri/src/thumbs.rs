@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use image::codecs::jpeg::JpegEncoder;
-use image::{ExtendedColorType, ImageEncoder, ImageReader};
+use image::{ExtendedColorType, ImageEncoder, ImageFormat, ImageReader};
 use md5::{Digest, Md5};
 use tauri::{AppHandle, Manager};
 use tokio::process::Command;
@@ -52,6 +52,18 @@ const VIDEO_HEAD_BYTES: u64 = 24 * 1024 * 1024;
 /// Parsing the container to locate `moov` would be more precise and far more
 /// fragile.
 const FULL_VIDEO_FALLBACK_BYTES: u64 = 200 * 1024 * 1024;
+
+/// One whole-file video fallback at a time: it holds the file in memory and on
+/// disk while ffmpeg reads it.
+static FULL_VIDEO_SLOT: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
+
+/// A `.vh-` video temporary older than this was left by a run that ended during
+/// an extraction (a crash, a kill); a live one exists for one ffmpeg call.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(600);
+
+/// How long the whole-file fallback may spend fetching the rest of a video.
+const FULL_VIDEO_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Cache ceiling; going over it evicts down to about 85% of this.
 const CACHE_CAP_BYTES: u64 = 256 * 1024 * 1024;
@@ -169,6 +181,7 @@ async fn remote_thumbnail(
     if size == 0 || size > MAX_SOURCE_BYTES {
         return Ok(None);
     }
+    let raw_etag = head.e_tag().map(str::to_string);
     let etag = head.e_tag().unwrap_or_default().trim_matches('"').to_string();
 
     let cache_key = format!("remote\0{bucket}\0{key}\0{etag}\0{THUMB_EDGE}");
@@ -178,21 +191,21 @@ async fn remote_thumbnail(
         return Ok(Some(to_data_uri(&bytes)));
     }
 
+    // The object read is the one measured: a replaced object fails the request
+    // instead of arriving larger than the size just checked. It is asked as a
+    // range, the form the gateway's `If-Match` was measured with.
     let obj = client
         .get_object()
         .bucket(&bucket)
         .key(&key)
+        .range(format!("bytes=0-{}", size - 1))
+        .set_if_match(raw_etag)
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    let src = obj
-        .body
-        .collect()
-        .await
-        .map_err(|e| e.to_string())?
-        .into_bytes();
+    let src = crate::core::read_capped(obj.body, size).await?;
 
-    finalize_thumb(src.to_vec(), cache_path, cache_dir).await
+    finalize_thumb(src, cache_path, cache_dir).await
 }
 
 // ── Video, through the system ffmpeg ───────────────────────────────────────────
@@ -252,6 +265,7 @@ async fn remote_video_thumbnail(
         .await
         .map_err(|e| e.to_string())?;
     let size = head.content_length().unwrap_or(0).max(0) as u64;
+    let raw_etag = head.e_tag().map(str::to_string);
     let etag = head.e_tag().unwrap_or_default().trim_matches('"').to_string();
 
     let cache_key = format!("remotevid\0{bucket}\0{key}\0{etag}\0{THUMB_EDGE}");
@@ -270,15 +284,11 @@ async fn remote_video_thumbnail(
         .bucket(&bucket)
         .key(&key)
         .range(format!("bytes=0-{}", want - 1))
+        .set_if_match(raw_etag.clone())
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    let head_bytes = obj
-        .body
-        .collect()
-        .await
-        .map_err(|e| e.to_string())?
-        .into_bytes();
+    let head_bytes = crate::core::read_capped(obj.body, want).await?;
 
     let ext = Path::new(&key)
         .extension()
@@ -292,15 +302,24 @@ async fn remote_video_thumbnail(
     // Only the missing part is requested; ffmpeg reads a complete file wherever
     // the index sits.
     if size > want && size <= FULL_VIDEO_FALLBACK_BYTES {
-        let rest = client
-            .get_object()
-            .bucket(&bucket)
-            .key(&key)
-            .range(format!("bytes={want}-{}", size - 1))
-            .send()
+        let _slot = FULL_VIDEO_SLOT.acquire().await.map_err(|e| e.to_string())?;
+        // A slow source gives the slot up in the end, so the videos waiting
+        // behind it get their turn.
+        let fetch = async {
+            let rest = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .range(format!("bytes={want}-{}", size - 1))
+                .set_if_match(raw_etag)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::core::read_capped(rest.body, size - want).await
+        };
+        let rest_bytes = tokio::time::timeout(FULL_VIDEO_FETCH_TIMEOUT, fetch)
             .await
-            .map_err(|e| e.to_string())?;
-        let rest_bytes = rest.body.collect().await.map_err(|e| e.to_string())?.into_bytes();
+            .map_err(|_| "the rest of the video took too long to arrive".to_string())??;
         let mut full = Vec::with_capacity(size as usize);
         full.extend_from_slice(&head_bytes);
         full.extend_from_slice(&rest_bytes);
@@ -316,7 +335,10 @@ async fn remote_video_thumbnail(
 async fn frame_from_head(bytes: &[u8], ext: &str, cache_dir: &Path) -> Option<Vec<u8>> {
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = cache_dir.join(format!(".vh-{}-{seq}.{ext}", std::process::id()));
-    std::fs::write(&tmp, bytes).ok()?;
+    if std::fs::write(&tmp, bytes).is_err() {
+        let _ = std::fs::remove_file(&tmp); // a full disk leaves what fitted
+        return None;
+    }
     let png = ffmpeg_frame(&tmp.to_string_lossy()).await;
     let _ = std::fs::remove_file(&tmp);
     png
@@ -346,7 +368,11 @@ async fn ffmpeg_available() -> bool {
 /// A clip shorter than a second has nothing at the first seek point, and no
 /// frame at all is an expected outcome, not an error.
 async fn ffmpeg_frame(input: &str) -> Option<Vec<u8>> {
-    let scale = format!("scale={THUMB_EDGE}:-1:flags=bilinear");
+    // The frame is fitted inside the tile, so an extreme aspect ratio cannot make
+    // it tall: the PNG read back from ffmpeg stays small.
+    let scale = format!(
+        "scale=w={THUMB_EDGE}:h={THUMB_EDGE}:force_original_aspect_ratio=decrease:flags=bilinear"
+    );
     for seek in ["1", "0"] {
         let mut cmd = Command::new("ffmpeg");
         cmd.args([
@@ -402,12 +428,36 @@ async fn finalize_thumb(
     .map_err(|e| format!("thumbnail task failed: {e}"))?
 }
 
+/// Images larger than this get the type icon instead of a thumbnail.
+const MAX_PIXELS: u64 = 100_000_000;
+
+/// True when an image this large is worth decoding for a thumbnail.
+fn pixels_ok(width: u32, height: u32, max_pixels: u64) -> bool {
+    u64::from(width) * u64::from(height) <= max_pixels
+}
+
 fn encode_thumb(bytes: &[u8]) -> Option<Vec<u8>> {
-    let img = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?;
+    encode_thumb_within(bytes, MAX_PIXELS)
+}
+
+/// `encode_thumb` with the pixel budget as a parameter, so a test can use a small one.
+fn encode_thumb_within(bytes: &[u8], max_pixels: u64) -> Option<Vec<u8>> {
+    let reader = || ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok();
+    // The size is read from the header first, so a huge image is never decoded.
+    let (width, height) = reader()?.into_dimensions().ok()?;
+    if !pixels_ok(width, height, max_pixels) {
+        return None;
+    }
+    let mut decoder = reader()?;
+    if decoder.format() == Some(ImageFormat::Gif) {
+        // A GIF's header gives the screen size, and a frame may be larger than
+        // its screen: the decoder's allocation limit covers what the check above
+        // cannot see. A GIF always decodes to 4 bytes a pixel.
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(max_pixels * 4);
+        decoder.limits(limits);
+    }
+    let img = decoder.decode().ok()?;
 
     // `thumbnail` keeps the aspect ratio; JPEG has no alpha, so transparency is
     // flattened away against the tile's own dark background.
@@ -466,7 +516,19 @@ fn enforce_cap(dir: &Path) {
             continue;
         }
         let p = entry.path();
-        // Only finished thumbnails are swept; temporary files belong to whoever is writing them.
+        if entry.file_name().to_string_lossy().starts_with(".vh-") {
+            let stale = m
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STALE_TEMP_AGE);
+            if stale {
+                let _ = std::fs::remove_file(&p);
+            }
+            continue;
+        }
+        // Only finished thumbnails count and are evicted; a temporary file belongs
+        // to whoever is writing it.
         if p.extension().and_then(|x| x.to_str()) != Some("jpg") {
             continue;
         }
@@ -486,5 +548,71 @@ fn enforce_cap(dir: &Path) {
         if std::fs::remove_file(&p).is_ok() {
             total = total.saturating_sub(sz);
         }
+    }
+}
+
+#[cfg(test)]
+mod pixel_tests {
+    use super::{MAX_PIXELS, encode_thumb_within, pixels_ok};
+
+    #[test]
+    fn an_image_above_100_megapixels_gets_the_type_icon() {
+        assert!(pixels_ok(8_000, 6_000, MAX_PIXELS)); // 48 MP, a large camera image
+        assert!(pixels_ok(10_000, 10_000, MAX_PIXELS)); // exactly 100 MP
+        assert!(!pixels_ok(10_001, 10_000, MAX_PIXELS));
+        assert!(!pixels_ok(u32::MAX, u32::MAX, MAX_PIXELS)); // no overflow
+    }
+
+    /// A 20x20 GIF whose header claims a 1x1 screen: the frame is larger than
+    /// the size the header gives.
+    fn gif_with_small_screen() -> Vec<u8> {
+        use image::codecs::gif::GifEncoder;
+        let mut out = Vec::new();
+        let frame = image::RgbaImage::from_pixel(20, 20, image::Rgba([200, 40, 40, 255]));
+        GifEncoder::new(&mut out)
+            .encode(frame.as_raw(), 20, 20, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        // The logical screen width and height sit right after "GIF89a".
+        out[6..10].copy_from_slice(&[1, 0, 1, 0]);
+        out
+    }
+
+    #[test]
+    fn a_gif_frame_larger_than_its_screen_stays_within_the_budget() {
+        let gif = gif_with_small_screen();
+        assert!(encode_thumb_within(&gif, 10_000).is_some(), "400 pixels fit a budget of 10000");
+        assert!(encode_thumb_within(&gif, 100).is_none(), "400 pixels must not fit a budget of 100");
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::enforce_cap;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn a_stale_video_temporary_is_swept_with_the_cache() {
+        let dir = std::env::temp_dir().join(format!("bgthumbs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join(".vh-1-1.mp4");
+        let live = dir.join(".vh-1-2.mp4");
+        let thumb = dir.join("a.jpg");
+        for p in [&old, &live, &thumb] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let long_ago = SystemTime::now() - Duration::from_secs(20 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        enforce_cap(&dir);
+
+        assert!(!old.exists(), "a temporary left from an earlier run is removed");
+        assert!(live.exists(), "a temporary in use stays");
+        assert!(thumb.exists(), "a thumbnail under the cap stays");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

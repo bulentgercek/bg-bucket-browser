@@ -262,6 +262,15 @@ h6 {
   outline-offset: 2px;
 }
 
+/* Nothing animates while the theme changes; `lib/theme.ts` sets this for a
+   frame. */
+.theme-switching,
+.theme-switching *,
+.theme-switching *::before,
+.theme-switching *::after {
+  transition: none !important;
+}
+
 /* ────────────────────────────────────────────────────────────────────────
    The controls. Layout is done with utility classes in the components; how a
    button, a field or a switch looks is decided here, once.

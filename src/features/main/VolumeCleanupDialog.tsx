@@ -265,7 +265,7 @@ export default function VolumeCleanupDialog() {
                   ) : (
                     report.topFolders.map((f) => (
                       <div
-                        key={f.prefix}
+                        key={`${f.isFile ? "f" : "d"}:${f.prefix}`}
                         className="flex items-center gap-2 rounded-sm px-2 py-1 text-[12px]"
                       >
                         {f.isFile ? (
@@ -320,7 +320,7 @@ export default function VolumeCleanupDialog() {
 
               {report.skipped.length > 0 && (
                 <Section
-                  title={`${t("cleanup.skipped")} · ${report.skipped.length}`}
+                  title={`${t("cleanup.skipped")} · ${report.skippedCount}`}
                   className={expanded === "skipped" ? "min-h-0 flex-1" : "shrink-0"}
                   bodyClassName={expanded === "skipped" ? listFill : "max-h-[84px] overflow-y-auto"}
                   action={
@@ -338,6 +338,14 @@ export default function VolumeCleanupDialog() {
                       <span className="min-w-0 flex-1 truncate text-neutral-500">{p}</span>
                     </div>
                   ))}
+                  {report.skippedCount > report.skipped.length && (
+                    <p className="px-2 py-1.5 text-[11px] text-neutral-600">
+                      {t("cleanup.skippedMore", {
+                        shown: report.skipped.length,
+                        count: report.skippedCount,
+                      })}
+                    </p>
+                  )}
                 </Section>
               )}
 
@@ -375,6 +383,16 @@ export default function VolumeCleanupDialog() {
                       onToggle={() => toggle(e.key)}
                     />
                   ))
+                )}
+                {/* The scan keeps only the largest reclaimable objects; the rest come up on the next scan. */}
+                {report.reclaimableCount > report.reclaimable.length && (
+                  <p className="px-2 py-1.5 text-[11px] text-neutral-600">
+                    {t("cleanup.reclaimableMore", {
+                      shown: report.reclaimable.length,
+                      count: report.reclaimableCount,
+                      size: formatSize(report.reclaimableBytes),
+                    })}
+                  </p>
                 )}
               </Section>
             </div>

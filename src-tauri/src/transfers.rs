@@ -9,7 +9,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,7 +31,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinSet;
 
 use crate::config::{active_client, active_connection_id, client_by_id};
-use crate::core::{put_object_verified, s3_err, verify_object_size};
+use crate::core::{PageGuard, TREE_MAX_ENTRIES, put_object_verified, s3_err, verify_object_size};
+use crate::zip_writer::ZipOut;
 use crate::fs_ops::ensure_not_root;
 use crate::local_path::resolve_local;
 
@@ -50,6 +51,10 @@ const DOWNLOAD_STREAMS: usize = 4;
 const DOWNLOAD_CHUNK: u64 = 8 * 1024 * 1024;
 /// How often a running download checks for cancellation and refreshes progress.
 const DOWNLOAD_TICK: Duration = Duration::from_millis(200);
+
+/// What a remote copy reports when its source was replaced while it ran.
+const ERR_SOURCE_CHANGED: &str =
+    "changed on the volume while it was being copied; start the copy again";
 
 /// What a download reports when its object was replaced while it ran.
 const ERR_CHANGED: &str =
@@ -91,16 +96,15 @@ async fn get_range_retry(
             .send()
             .await
         {
-            Ok(obj) => match obj.body.collect().await {
+            Ok(obj) => match crate::core::read_capped(obj.body, want).await {
                 Ok(data) => {
-                    let data = data.into_bytes();
                     if data.len() as u64 == want {
                         Ok(data)
                     } else {
                         Err(format!("{range} came back with {} bytes instead of {want}", data.len()))
                     }
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(e),
             },
             Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 412) => {
                 return Err(ERR_CHANGED.into());
@@ -147,13 +151,17 @@ struct Job {
     conflict: String,
     /// Zip jobs only: the remote sources that go into the archive.
     zip_srcs: Vec<ZipSrc>,
-    /// Connection this job was queued with; `None` for local-only jobs.
+    /// Connection the user started this job on; `None` for local-only jobs.
     conn_id: Option<String>,
     cancel: Arc<AtomicBool>,
     /// Local source files that really reached the destination; a Move deletes only these.
-    sent_local: Mutex<Vec<PathBuf>>,
-    /// Remote source keys that really reached the destination, `.keep` markers included.
-    sent_remote: Mutex<Vec<String>>,
+    sent_local: Mutex<Vec<Sent>>,
+    /// Remote source keys that really reached the destination, `.keep` markers
+    /// included, each with the ETag of the version that was read.
+    sent_remote: Mutex<Vec<SentRemote>>,
+    /// Remote keys a Move must leave where they are: folder markers that hold
+    /// data and were not transferred. The folders above them stay too.
+    keep_remote: Mutex<Vec<String>>,
 }
 
 /// One remote source inside a zip job: a file, or a folder taken as a prefix.
@@ -171,6 +179,8 @@ pub struct TransferManager {
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     running: Arc<AtomicBool>,
     counter: Arc<AtomicU64>,
+    /// The connection of the job the worker is running, if any.
+    current: Arc<Mutex<Option<String>>>,
 }
 
 impl TransferManager {
@@ -180,7 +190,19 @@ impl TransferManager {
             cancels: Arc::new(Mutex::new(HashMap::new())),
             running: Arc::new(AtomicBool::new(false)),
             counter: Arc::new(AtomicU64::new(1)),
+            current: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// True when a job of connection `id` is waiting or running.
+    // The queue lock is taken first, as the worker does when it moves a job from
+    // the queue to `current`: a job is always seen in one of the two.
+    fn busy_with(&self, id: &str) -> bool {
+        let queue = self.queue.lock().unwrap();
+        queue
+            .iter()
+            .any(|j| j.conn_id.as_deref() == Some(id) && !j.cancel.load(Ordering::Relaxed))
+            || self.current.lock().unwrap().as_deref() == Some(id)
     }
 
     fn next_id(&self) -> String {
@@ -192,6 +214,12 @@ impl Default for TransferManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// True when a transfer of connection `id` is waiting or running. Settings asks
+/// before changing where that connection points.
+pub fn connection_busy(app: &AppHandle, id: &str) -> bool {
+    app.state::<TransferManager>().busy_with(id)
 }
 
 #[derive(Serialize, Clone)]
@@ -229,6 +257,27 @@ struct RetryEvt {
 #[serde(rename_all = "camelCase")]
 struct ErrEvt {
     id: String,
+    /// The job's name as its queue row shows it; the error can arrive before
+    /// the row does.
+    name: String,
+    detail: String,
+}
+
+/// A job's name as its queue row shows it: an archive carries its `.zip`.
+fn shown_name(job: &Job) -> String {
+    if job.kind == "downloadZip" {
+        format!("{}.zip", job.name)
+    } else {
+        job.name.clone()
+    }
+}
+
+/// What a finished folder job left out on purpose.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NoteEvt {
+    id: String,
+    name: String,
     detail: String,
 }
 
@@ -268,6 +317,7 @@ pub fn transfer_start(
     is_dir: bool,
     move_src: bool,
     conflict: String,
+    conn_id: Option<String>,
 ) -> Result<String, String> {
     // A move deletes its source afterwards.
     if move_src {
@@ -278,8 +328,14 @@ pub fn transfer_start(
     let id = mgr.next_id();
     let cancel = Arc::new(AtomicBool::new(false));
     mgr.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
-    // The connection is taken here, not when the worker picks the job up.
-    let conn_id = active_connection_id(app.clone());
+    // The connection is the one the user started the job on; the frontend
+    // takes it before anything waits. Without one, the active connection now.
+    // A local-only job uses none, and must not hold one busy.
+    let conn_id = if matches!(kind.as_str(), "localCopy" | "localMove") {
+        None
+    } else {
+        conn_id.or_else(|| active_connection_id(app.clone()))
+    };
     mgr.queue.lock().unwrap().push_back(Job {
         id: id.clone(),
         kind,
@@ -294,6 +350,7 @@ pub fn transfer_start(
         cancel,
         sent_local: Mutex::new(Vec::new()),
         sent_remote: Mutex::new(Vec::new()),
+        keep_remote: Mutex::new(Vec::new()),
     });
     ensure_worker(app, mgr);
     Ok(id)
@@ -307,6 +364,7 @@ pub fn transfer_zip_start(
     srcs: Vec<ZipSrc>,
     dest_dir: String,
     name: String,
+    conn_id: Option<String>,
 ) -> Result<String, String> {
     if srcs.is_empty() {
         return Err("no sources for zip".into());
@@ -315,7 +373,7 @@ pub fn transfer_zip_start(
     let id = mgr.next_id();
     let cancel = Arc::new(AtomicBool::new(false));
     mgr.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
-    let conn_id = active_connection_id(app.clone());
+    let conn_id = conn_id.or_else(|| active_connection_id(app.clone()));
     mgr.queue.lock().unwrap().push_back(Job {
         id: id.clone(),
         kind: "downloadZip".into(),
@@ -330,6 +388,7 @@ pub fn transfer_zip_start(
         cancel,
         sent_local: Mutex::new(Vec::new()),
         sent_remote: Mutex::new(Vec::new()),
+        keep_remote: Mutex::new(Vec::new()),
     });
     ensure_worker(app, mgr);
     Ok(id)
@@ -342,12 +401,13 @@ pub fn open_remote_start(
     manager: tauri::State<'_, TransferManager>,
     path: String,
     name: String,
+    conn_id: Option<String>,
 ) -> Result<String, String> {
     let mgr = (*manager).clone();
     let id = mgr.next_id();
     let cancel = Arc::new(AtomicBool::new(false));
     mgr.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
-    let conn_id = active_connection_id(app.clone());
+    let conn_id = conn_id.or_else(|| active_connection_id(app.clone()));
     mgr.queue.lock().unwrap().push_back(Job {
         id: id.clone(),
         kind: "openDownload".into(),
@@ -362,6 +422,7 @@ pub fn open_remote_start(
         cancel,
         sent_local: Mutex::new(Vec::new()),
         sent_remote: Mutex::new(Vec::new()),
+        keep_remote: Mutex::new(Vec::new()),
     });
     ensure_worker(app, mgr);
     Ok(id)
@@ -421,8 +482,24 @@ fn ensure_worker(app: AppHandle, mgr: TransferManager) {
             }
         }
         let _guard = Guard(mgr.running.clone());
+        // The running job's connection stays marked until its iteration ends,
+        // even if it panics.
+        struct Current(Arc<Mutex<Option<String>>>);
+        impl Drop for Current {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = None;
+            }
+        }
         loop {
-            let job = mgr.queue.lock().unwrap().pop_front();
+            // Taken from the queue and marked as current under one lock, so
+            // Settings never sees the job in neither place.
+            let job = {
+                let mut queue = mgr.queue.lock().unwrap();
+                let job = queue.pop_front();
+                *mgr.current.lock().unwrap() = job.as_ref().and_then(|j| j.conn_id.clone());
+                job
+            };
+            let _current = Current(mgr.current.clone());
             let Some(job) = job else {
                 mgr.running.store(false, Ordering::SeqCst);
                 // A job may have arrived between the pop and the flag; take the queue back.
@@ -471,6 +548,7 @@ fn ensure_worker(app: AppHandle, mgr: TransferManager) {
                             "transfer-error",
                             ErrEvt {
                                 id,
+                                name: shown_name(&job),
                                 detail: format!("copied, but source not removed: {e}"),
                             },
                         );
@@ -483,7 +561,7 @@ fn ensure_worker(app: AppHandle, mgr: TransferManager) {
                 }
                 // Reported like an error, so the user learns the item did not arrive.
                 Ok(Outcome::Skipped(detail)) | Err(detail) => {
-                    let _ = app.emit("transfer-error", ErrEvt { id, detail });
+                    let _ = app.emit("transfer-error", ErrEvt { id, name: shown_name(&job), detail });
                 }
             }
         }
@@ -527,6 +605,107 @@ fn opened_hash(bucket: &str, key: &str, etag: &str) -> String {
     URL_SAFE_NO_PAD.encode(h.finalize())
 }
 
+/// Marks a downloaded file as coming from the network, the way a browser does,
+/// so the system's own checks (SmartScreen, Gatekeeper, Office's protected view)
+/// apply when it is opened. Linux has no such mark. A filesystem without the
+/// feature (FAT, exFAT) keeps the file unmarked; on macOS no `._` side file is
+/// written in its place, on a network share without attributes either.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(unused_variables))]
+fn mark_from_network(path: &Path) {
+    #[cfg(windows)]
+    {
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        if let Err(e) = fs::write(&stream, "[ZoneTransfer]\r\nZoneId=3\r\n") {
+            crate::devlog::verbose("transfer", format!("network mark not set on {}: {e}", path.display()));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return;
+        };
+        // A volume that cannot hold extended attributes itself (FAT, exFAT, a
+        // share without them) would keep the mark in a `._` side file; there
+        // the file stays unmarked rather than gaining one.
+        if !keeps_attributes_itself(&c_path) {
+            crate::devlog::verbose(
+                "transfer",
+                format!("network mark not set on {}: the volume keeps no attributes of its own", path.display()),
+            );
+            return;
+        }
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let value = format!("0081;{secs:08x};BG Bucket Browser;");
+        // SAFETY: both names are NUL-terminated C strings that outlive the call,
+        // and the value is passed as a byte buffer with its length.
+        let rc = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                c"com.apple.quarantine".as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            crate::devlog::verbose("transfer", format!("network mark not set on {}: {e}", path.display()));
+        }
+    }
+}
+
+/// Whether the volume `path` is on says it stores extended attributes with
+/// the file, rather than in `._` side files. A volume that does not say, or
+/// cannot be asked, is taken not to.
+#[cfg(target_os = "macos")]
+fn keeps_attributes_itself(path: &std::ffi::CStr) -> bool {
+    // SAFETY: statfs fills the zeroed struct it is given; the path is a
+    // NUL-terminated C string that outlives the call.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    // Volume attributes are asked of the volume's root.
+    #[repr(C)]
+    struct Answer {
+        length: u32,
+        caps: libc::vol_capabilities_attr_t,
+    }
+    let mut ask = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // SAFETY: the answer is plain integers, so zeroed is a valid value; the
+    // mount point from statfs is NUL-terminated, and the buffer and its size
+    // describe the same struct.
+    let mut answer: Answer = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::getattrlist(
+            st.f_mntonname.as_ptr(),
+            (&mut ask as *mut libc::attrlist).cast(),
+            (&mut answer as *mut Answer).cast(),
+            std::mem::size_of::<Answer>(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    let i = libc::VOL_CAPABILITIES_INTERFACES;
+    let bit = libc::VOL_CAP_INT_EXTENDED_ATTR;
+    answer.caps.valid[i] & bit != 0 && answer.caps.capabilities[i] & bit != 0
+}
+
 /// Marks the downloaded copy read-only so an editor shows it cannot be saved back.
 fn make_read_only(path: &std::path::Path) {
     if let Ok(meta) = fs::metadata(path) {
@@ -551,9 +730,10 @@ async fn run_open_download(app: &AppHandle, job: &Job) -> Result<Outcome, String
     let size = head.content_length().unwrap_or(0).max(0) as u64;
     let etag = head.e_tag().unwrap_or_default().trim_matches('"').to_string();
 
-    let cache_path = opened_dir(app)?
-        .join(opened_hash(&bucket, &key, &etag))
-        .join(&job.name);
+    let cache_path = join_name(
+        &opened_dir(app)?.join(opened_hash(&bucket, &key, &etag)),
+        &job.name,
+    )?;
 
     // Already in the cache with the right size: open it without downloading.
     if let Ok(meta) = fs::metadata(&cache_path)
@@ -572,6 +752,7 @@ async fn run_open_download(app: &AppHandle, job: &Job) -> Result<Outcome, String
         None, "overwrite",
     )
     .await?
+    .0
     {
         Outcome::Canceled => Ok(Outcome::Canceled),
         Outcome::Skipped(why) => Ok(Outcome::Skipped(why)),
@@ -583,57 +764,170 @@ async fn run_open_download(app: &AppHandle, job: &Job) -> Result<Outcome, String
     }
 }
 
+/// Deletes one remote source object of a finished Move, only while it is still
+/// the version that was sent. `Ok(false)` when it changed since and was kept.
+async fn delete_sent_object(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    etag: Option<&str>,
+) -> Result<bool, String> {
+    let version = etag.filter(|e| !e.is_empty()).map(str::to_string);
+    match client.delete_object().bucket(bucket).key(key).set_if_match(version).send().await {
+        Ok(_) => Ok(true),
+        // The gateway answers a key that is no longer there with 412 too, which is
+        // also how a retried delete whose first answer was lost ends.
+        Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 412) => {
+            Ok(client.head_object().bucket(bucket).key(key).send().await.is_err_and(|e| {
+                e.raw_response().is_some_and(|r| r.status().as_u16() == 404)
+            }))
+        }
+        Err(e) => Err(s3_err(&e)),
+    }
+}
+
+/// Deletes the remote sources of a finished Move: each object only while it is
+/// the version that was sent, then the folder markers that emptied. A folder
+/// keeps its markers above anything left behind.
+async fn delete_remote_sources(
+    client: &Client,
+    bucket: &str,
+    src: &str,
+    is_dir: bool,
+    sent: &[SentRemote],
+    keep: &[String],
+) -> Result<(), String> {
+    if !is_dir {
+        let key = remote_key(src);
+        let etag = sent.iter().find(|(k, _)| *k == key).and_then(|(_, e)| e.as_deref());
+        if !delete_sent_object(client, bucket, &key, etag).await? {
+            return Err(format!("{key}: changed after it was sent, so it was kept"));
+        }
+        return Ok(());
+    }
+    let prefix = as_prefix(src);
+    let (mut kept, mut failed) = (Vec::new(), 0usize);
+    for (k, etag) in sent {
+        match delete_sent_object(client, bucket, k, etag.as_deref()).await {
+            Ok(true) => {}
+            Ok(false) => kept.push(k.strip_prefix(&prefix).unwrap_or(k).to_string()),
+            Err(_) => failed += 1,
+        }
+    }
+    let keys: Vec<String> = sent.iter().map(|(k, _)| k.clone()).collect();
+    // What stays: objects that changed or failed, and markers never transferred.
+    let mut left: Vec<String> = kept.iter().map(|rel| format!("{prefix}{rel}")).collect();
+    left.extend(keep.iter().cloned());
+    // Subfolders go from the deepest outwards, because the gateway only removes an empty one.
+    for dir in nested_dir_prefixes(&prefix, &keys) {
+        if !left.iter().any(|k| k.starts_with(&dir)) {
+            let _ = client.delete_object().bucket(bucket).key(&dir).send().await;
+        }
+    }
+    if left.is_empty() && failed == 0 {
+        let _ = client.delete_object().bucket(bucket).key(&prefix).send().await;
+    }
+    let mut problems = Vec::new();
+    if !kept.is_empty() {
+        problems.push(format!("changed after they were sent and were kept: {}", some_names(&kept)));
+    }
+    if failed > 0 {
+        problems.push(format!("{failed} object(s) could not be removed"));
+    }
+    if problems.is_empty() { Ok(()) } else { Err(problems.join("; ")) }
+}
+
 /// Deletes the source of a finished Move.
 async fn delete_source(app: &AppHandle, job: &Job) -> Result<(), String> {
     match job.kind.as_str() {
         "download" | "remoteCopy" | "remoteMove" => {
             let (client, bucket) = s3_job(app, &job.conn_id)?;
-            if job.is_dir {
-                let prefix = as_prefix(&job.src);
-                // Only what was really transferred is deleted; the source is never re-listed.
-                let keys = job.sent_remote.lock().unwrap().clone();
-                for k in &keys {
-                    let _ = client.delete_object().bucket(&bucket).key(k).send().await;
-                }
-                // Subfolders go from the deepest outwards, because the gateway only removes an empty one.
-                for dir in nested_dir_prefixes(&prefix, &keys) {
-                    let _ = client.delete_object().bucket(&bucket).key(&dir).send().await;
-                }
-                let _ = client
-                    .delete_object()
-                    .bucket(&bucket)
-                    .key(&prefix)
-                    .send()
-                    .await;
-            } else {
-                client
-                    .delete_object()
-                    .bucket(&bucket)
-                    .key(remote_key(&job.src))
-                    .send()
-                    .await
-                    .map_err(|e| s3_err(&e))?;
-            }
+            // Only what was really transferred is deleted; the source is never re-listed.
+            let sent = job.sent_remote.lock().unwrap().clone();
+            let keep = job.keep_remote.lock().unwrap().clone();
+            return delete_remote_sources(&client, &bucket, &job.src, job.is_dir, &sent, &keep).await;
         }
         "upload" | "localCopy" | "localMove" => {
             let p = resolve_local(&job.src)?;
-            if job.is_dir {
-                // Same rule locally: delete the sent files, not the whole tree.
-                let sent = job.sent_local.lock().unwrap().clone();
-                return remove_sent_files(&p, &sent);
-            }
-            match fs::remove_file(&p) {
-                Ok(()) => {
-                    let _ = fs::remove_file(sidecar_of(&p));
-                }
-                // A local move may already have renamed the file away; nothing left to delete.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.to_string()),
-            }
+            let sent = job.sent_local.lock().unwrap().clone();
+            return remove_local_source(&p, job.is_dir, &sent);
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Deletes the local source of a finished Move.
+fn remove_local_source(p: &Path, is_dir: bool, sent: &[Sent]) -> Result<(), String> {
+    // A folder chosen through a symbolic link was sent with its content; the
+    // move takes the link away and leaves the folder it points to as it was.
+    if is_dir && is_link(p) {
+        return remove_link(p).map_err(|e| e.to_string());
+    }
+    if is_dir {
+        // Same rule locally: delete the sent files, not the whole tree.
+        return remove_sent_files(p, sent);
+    }
+    // Only a file on record as sent is deleted: a rename already took it away,
+    // and whatever holds its name now arrived afterwards.
+    let Some((_, stamp)) = sent.iter().find(|(f, _)| f == p) else {
+        return Ok(());
+    };
+    // A file saved again since it was read is not the one that was sent.
+    if let Some(stamp) = stamp
+        && fs::metadata(p).is_ok_and(|m| source_stamp(&m) != *stamp)
+    {
+        return Err(format!("{}: changed after it was sent, so it was kept", p.display()));
+    }
+    match fs::remove_file(p) {
+        Ok(()) => {
+            let _ = fs::remove_file(sidecar_of(p));
+        }
+        // A local move may already have renamed the file away; nothing left to delete.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    Ok(())
+}
+
+/// Removes a symbolic link standing where a side file is about to be written,
+/// so the write makes a new file instead of going through the link.
+fn clear_link(path: &Path) -> std::io::Result<()> {
+    if is_link(path) {
+        return remove_link(path);
+    }
+    Ok(())
+}
+
+/// True when `p` itself is a symbolic link (on Windows also a junction).
+fn is_link(p: &Path) -> bool {
+    fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Deletes a symbolic link itself, never what it points to.
+fn remove_link(p: &Path) -> std::io::Result<()> {
+    // Windows removes a link to a folder, and a junction, as a directory.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if fs::symlink_metadata(p)?.file_type().is_symlink_dir() {
+            return fs::remove_dir(p);
+        }
+    }
+    fs::remove_file(p)
+}
+
+/// Writes a small side file (a resume record), never through a link.
+fn write_side(path: &Path, contents: &str) {
+    if clear_link(path).is_ok() {
+        let _ = fs::write(path, contents);
+    }
+}
+
+/// Creates a side file (a `.part`) for writing, never through a link.
+fn create_side(path: &Path) -> std::io::Result<fs::File> {
+    clear_link(path)?;
+    fs::File::create(path)
 }
 
 const ERR_INTO_ITSELF: &str = "can't copy or move a folder into itself";
@@ -660,12 +954,23 @@ fn local_is_within(src: &std::path::Path, dest: &std::path::Path) -> bool {
 
 /// Delete step of a local folder Move: removes the files that were really sent, then the
 /// directories that became empty. Anything left behind keeps its folder.
-fn remove_sent_files(root: &std::path::Path, sent: &[PathBuf]) -> Result<(), String> {
+fn remove_sent_files(root: &std::path::Path, sent: &[Sent]) -> Result<(), String> {
     if !root.exists() {
         return Ok(());
     }
-    let mut failed = 0usize;
-    for f in sent {
+    let (mut failed, mut changed) = (0usize, 0usize);
+    for (f, stamp) in sent {
+        // A file saved again since it was read is not the one that was sent.
+        if let Some(stamp) = stamp {
+            match fs::metadata(f) {
+                Ok(m) if source_stamp(&m) != *stamp => {
+                    changed += 1;
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                _ => {}
+            }
+        }
         match fs::remove_file(f) {
             Ok(()) => {
                 let _ = fs::remove_file(sidecar_of(f));
@@ -680,6 +985,10 @@ fn remove_sent_files(root: &std::path::Path, sent: &[PathBuf]) -> Result<(), Str
     while i < dirs.len() {
         if let Ok(rd) = fs::read_dir(&dirs[i]) {
             for e in rd.flatten() {
+                // A folder the walk left out for its name was not sent, so it stays.
+                if e.file_name().to_str().is_none() {
+                    continue;
+                }
                 if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     dirs.push(e.path());
                 }
@@ -691,8 +1000,15 @@ fn remove_sent_files(root: &std::path::Path, sent: &[PathBuf]) -> Result<(), Str
     for d in dirs {
         let _ = fs::remove_dir(&d);
     }
+    let mut problems = Vec::new();
+    if changed > 0 {
+        problems.push(format!("{changed} file(s) changed after they were sent and were kept"));
+    }
     if failed > 0 {
-        return Err(format!("{failed} file(s) could not be removed"));
+        problems.push(format!("{failed} file(s) could not be removed"));
+    }
+    if !problems.is_empty() {
+        return Err(problems.join("; "));
     }
     Ok(())
 }
@@ -810,23 +1126,137 @@ fn remote_key(path: &str) -> String {
     path.trim_start_matches('/').to_string()
 }
 
-/// True when a path taken from a remote key stays inside the folder it is
-/// joined onto: every part is an ordinary name, so no `..`, no leading `/`, no
-/// drive letter.
-fn safe_rel(rel: &str) -> bool {
-    !rel.is_empty()
-        && Path::new(rel)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
+/// Why a download refuses a name: it cannot be one file or folder name here.
+const UNSAFE_NAME: &str = "not transferred: the name is not a safe file name on this system";
+
+/// True when `name` can be exactly one file or folder name: not empty, not `.`
+/// or `..`, no `/`. With Windows rules it also carries none of the forms that
+/// change what a path points at (`\`, a drive or stream `:`, a device name, a
+/// name Windows trims to nothing) and no character Windows cannot store.
+fn is_local_name(name: &str, windows: bool) -> bool {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return false;
+    }
+    if !windows {
+        return true;
+    }
+    if name.chars().any(|c| c < ' ' || "\\:<>\"|?*".contains(c)) {
+        return false;
+    }
+    // Windows drops trailing dots and spaces, so a name made only of them
+    // names the folder itself.
+    if name.trim_end_matches(['.', ' ']).is_empty() {
+        return false;
+    }
+    // Device names are reserved with any extension: `con.txt` is the console.
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let port_number = |s: &str| {
+        matches!(s, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "\u{b9}" | "\u{b2}" | "\u{b3}")
+    };
+    let device = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|d| stem.eq_ignore_ascii_case(d))
+        || ["COM", "LPT"].iter().any(|port| {
+            stem.get(..3).is_some_and(|head| head.eq_ignore_ascii_case(port))
+                && stem.get(3..).is_some_and(port_number)
+        });
+    !device
+}
+
+/// The same check with the rules of the system the app runs on.
+fn local_name_ok(name: &str) -> bool {
+    is_local_name(name, cfg!(windows))
+}
+
+/// Joins one remote-derived name onto a local folder, refusing a name that is
+/// not a single safe name here.
+fn join_name(root: &Path, name: &str) -> Result<PathBuf, String> {
+    if !local_name_ok(name) {
+        return Err(UNSAFE_NAME.into());
+    }
+    Ok(root.join(name))
+}
+
+/// The parts of a remote-relative path, each checked with `is_local_name`, or
+/// `None` when one is unsafe. Empty and `.` parts are dropped as a path reader
+/// would; a leading `/` is refused.
+fn rel_parts(rel: &str, windows: bool) -> Option<Vec<&str>> {
+    if rel.starts_with('/') {
+        return None;
+    }
+    let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
+    (!parts.is_empty() && parts.iter().all(|p| is_local_name(p, windows))).then_some(parts)
 }
 
 /// Joins a remote-relative path onto a local root, refusing one that would land
-/// outside it.
+/// outside it. Each part is pushed on its own, so no part can replace the root.
 fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    if !safe_rel(rel) {
-        return Err(format!("unsafe path in object name: {rel}"));
+    let parts = rel_parts(rel, cfg!(windows))
+        .ok_or_else(|| format!("unsafe path in object name: {rel}"))?;
+    let mut out = root.to_path_buf();
+    out.extend(parts);
+    Ok(out)
+}
+
+/// True when `part` can be one part of a zip member name wherever the archive
+/// is extracted: an ordinary name, no `\`, which a Windows extractor reads as
+/// a separator, and no drive prefix such as `C:`.
+fn zip_part_ok(part: &str) -> bool {
+    let drive = part.as_bytes().get(1) == Some(&b':') && part.as_bytes()[0].is_ascii_alphabetic();
+    is_local_name(part, false) && !part.contains('\\') && !drive
+}
+
+/// The path of one member inside a zip archive, built from checked parts.
+/// Empty and `.` parts are dropped as a path reader would.
+fn zip_member(top: &str, rel: &str) -> Result<String, String> {
+    let unsafe_path = || {
+        let shown = if top.is_empty() { rel.to_string() } else { format!("{top}/{rel}") };
+        format!("unsafe path for a zip entry: {shown}")
+    };
+    if rel.starts_with('/') {
+        return Err(unsafe_path());
     }
-    Ok(root.join(rel))
+    let rel_parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
+    if rel_parts.is_empty() {
+        return Err(unsafe_path());
+    }
+    let parts: Vec<&str> = (!top.is_empty()).then_some(top).into_iter().chain(rel_parts).collect();
+    if !parts.iter().all(|p| zip_part_ok(p)) {
+        return Err(unsafe_path());
+    }
+    Ok(parts.join("/"))
+}
+
+/// What one listed key of a folder download becomes locally.
+enum FolderItem<'a> {
+    /// A folder to create, from a `.keep` marker or a key ending in `/`; `""`
+    /// is the downloaded folder itself.
+    Dir(&'a str),
+    /// A file at this path, relative to the downloaded folder.
+    File(&'a str),
+    /// A folder marker that holds data: it cannot arrive as a folder, and is
+    /// left where it is.
+    Held(&'a str),
+}
+
+/// Sorts one key listed under `prefix` by its name and size; `None` for the
+/// prefix's own marker. Only an empty marker stands for a folder: one that
+/// holds data would be lost if it arrived as a folder, and a Move would then
+/// delete the data that never arrived.
+fn folder_item<'a>(prefix: &str, key: &'a str, size: u64) -> Option<FolderItem<'a>> {
+    let rel = key.strip_prefix(prefix).unwrap_or(key);
+    if rel.is_empty() {
+        return None;
+    }
+    // A `.keep` marker stands for an empty remote folder and becomes a real directory here.
+    if key.ends_with("/.keep") && size == 0 {
+        return Some(FolderItem::Dir(rel.rsplit_once('/').map_or("", |(dir, _)| dir)));
+    }
+    // Some servers keep a folder as an object whose key ends in `/`.
+    if let Some(dir) = rel.strip_suffix('/') {
+        return Some(if size == 0 { FolderItem::Dir(dir) } else { FolderItem::Held(rel) });
+    }
+    Some(FolderItem::File(rel))
 }
 
 /// Progress context of a folder job: bytes already done, the folder total, and its clock.
@@ -840,44 +1270,74 @@ async fn run_download(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
     let clients = stream_clients(&client);
 
     if !job.is_dir {
-        let out = safe_join(&dest_root, &job.name)?;
-        return download_one(
-            app, &clients, &bucket, &remote_key(&job.src), &out, &job.id,
-            &job.cancel, None, &job.conflict,
+        let key = remote_key(&job.src);
+        let out = join_name(&dest_root, &job.name)?;
+        let (outcome, etag) = download_one(
+            app, &clients, &bucket, &key, &out, &job.id, &job.cancel, None, &job.conflict,
         )
-        .await;
+        .await?;
+        if matches!(outcome, Outcome::Done) {
+            job.sent_remote.lock().unwrap().push((key, etag));
+        }
+        return Ok(outcome);
     }
 
     // A folder job downloads every object under the prefix and rebuilds the tree locally.
     let prefix = as_prefix(&job.src);
-    let folder_root = dest_root.join(&job.name);
+    let folder_root = join_name(&dest_root, &job.name)?;
+    let Some(objects) = list_objects_all(&client, &bucket, &prefix, &job.cancel).await? else {
+        return Ok(Outcome::Canceled);
+    };
+    // Every path is checked before anything is written, so a refused folder
+    // leaves nothing half-downloaded behind.
+    for (key, sz, _) in &objects {
+        match folder_item(&prefix, key, *sz) {
+            Some(FolderItem::Dir(dir)) if !dir.is_empty() => {
+                safe_join(&folder_root, dir)?;
+            }
+            Some(FolderItem::File(rel)) => {
+                safe_join(&folder_root, rel)?;
+            }
+            _ => {}
+        }
+    }
     fs::create_dir_all(&folder_root).map_err(|e| e.to_string())?; // an empty folder still arrives
-    let objects = list_objects_all(&client, &bucket, &prefix).await?;
+    // Only what comes down counts: folder markers do not, a marker that holds
+    // data and so arrives as a file does.
     let total: u64 = objects
         .iter()
-        .filter(|(k, _, _)| !k.ends_with("/.keep"))
+        .filter(|(k, sz, _)| matches!(folder_item(&prefix, k, *sz), Some(FolderItem::File(_))))
         .map(|(_, sz, _)| *sz)
         .sum();
     let clock = Instant::now();
     let mut done: u64 = 0;
     emit_progress(app, &job.id, 0, total, 0);
 
-    for (key, sz, _) in &objects {
+    let mut left = LeftOut::default();
+    // The folder's own marker never arrives; one that holds data must stay.
+    if objects.iter().any(|(k, sz, _)| *k == prefix && *sz > 0) {
+        job.keep_remote.lock().unwrap().push(prefix.clone());
+    }
+    for (key, sz, listed_etag) in &objects {
         if job.cancel.load(Ordering::Relaxed) {
             return Ok(Outcome::Canceled);
         }
-        let rel = key.strip_prefix(&prefix).unwrap_or(key);
-        if rel.is_empty() {
-            continue;
-        }
-        // A `.keep` marker stands for an empty remote folder and becomes a real directory here.
-        if key.ends_with("/.keep") {
-            if let Some((dir, _)) = rel.rsplit_once('/') {
-                fs::create_dir_all(safe_join(&folder_root, dir)?).map_err(|e| e.to_string())?;
+        let rel = match folder_item(&prefix, key, *sz) {
+            None => continue,
+            Some(FolderItem::Held(rel)) => {
+                left.held.push(rel.to_string());
+                job.keep_remote.lock().unwrap().push(key.clone());
+                continue;
             }
-            job.sent_remote.lock().unwrap().push(key.clone());
-            continue;
-        }
+            Some(FolderItem::Dir(dir)) => {
+                if !dir.is_empty() {
+                    fs::create_dir_all(safe_join(&folder_root, dir)?).map_err(|e| e.to_string())?;
+                }
+                job.sent_remote.lock().unwrap().push((key.clone(), Some(listed_etag.clone())));
+                continue;
+            }
+            Some(FolderItem::File(rel)) => rel,
+        };
         let out = safe_join(&folder_root, rel)?;
         // A skipped file was not transferred, so a Move must leave it in place.
         if job.conflict == "skip" && out.exists() {
@@ -889,15 +1349,20 @@ async fn run_download(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
             app, &clients, &bucket, key, &out, &job.id, &job.cancel,
             Some((done, total, clock)), &job.conflict,
         )
-        .await?
+        .await
         {
-            Outcome::Canceled => return Ok(Outcome::Canceled),
-            Outcome::Done => job.sent_remote.lock().unwrap().push(key.clone()),
-            Outcome::Skipped(_) => {}
+            Ok((Outcome::Canceled, _)) => return Ok(Outcome::Canceled),
+            Ok((Outcome::Done, etag)) => job.sent_remote.lock().unwrap().push((key.clone(), etag)),
+            Ok((Outcome::Skipped(_), _)) => {}
+            // One object written again while it came down is left out and named;
+            // the rest of the folder still arrives.
+            Err(e) if e == ERR_CHANGED => left.changed.push(rel.to_string()),
+            Err(e) => return Err(e),
         }
         done += *sz;
     }
     emit_progress(app, &job.id, total, total, 0);
+    emit_skipped(app, &job.id, &job.name, &left);
     Ok(Outcome::Done)
 }
 
@@ -912,7 +1377,8 @@ fn stream_clients(client: &Client) -> Vec<Client> {
     clients
 }
 
-/// Downloads one object into `<out>.part` in parallel chunks and renames it when complete.
+/// Downloads one object into `<out>.part` in parallel chunks and renames it when
+/// complete. A finished download comes back with the ETag of the version read.
 ///
 /// `clients` are the stream clients from `stream_clients`; the first one also
 /// asks for the object's size.
@@ -927,11 +1393,11 @@ async fn download_one(
     cancel: &Arc<AtomicBool>,
     agg: Agg,
     conflict: &str,
-) -> Result<Outcome, String> {
+) -> Result<(Outcome, Option<String>), String> {
     // Name already taken: skip returns, rename picks a free name, overwrite keeps going.
     let target: PathBuf = if out_path.exists() {
         match conflict {
-            "skip" => return Ok(Outcome::Skipped(SKIP_TAKEN.into())),
+            "skip" => return Ok((Outcome::Skipped(SKIP_TAKEN.into()), None)),
             "rename" => {
                 let dir = out_path
                     .parent()
@@ -955,6 +1421,8 @@ async fn download_one(
     }
     let part_path = dot_sibling(out_path, ".part");
     let meta_path = dot_sibling(out_path, ".bgdl");
+    clear_link(&part_path).map_err(|e| e.to_string())?;
+    clear_link(&meta_path).map_err(|e| e.to_string())?;
 
     let head = clients[0]
         .head_object()
@@ -988,7 +1456,7 @@ async fn download_one(
             chunk: DOWNLOAD_CHUNK,
             done_chunks,
         };
-        let _ = fs::write(&meta_path, serde_json::to_string(&rec).unwrap_or_default());
+        write_side(&meta_path, &serde_json::to_string(&rec).unwrap_or_default());
     };
     if !resume_ok {
         let _ = fs::remove_file(&part_path);
@@ -1089,7 +1557,7 @@ async fn download_one(
                 if cancel.load(Ordering::Relaxed) {
                     running.abort_all();
                     write_sidecar(watermark);
-                    return Ok(Outcome::Canceled); // `.part` and its sidecar stay for a resume
+                    return Ok((Outcome::Canceled, None)); // `.part` and its sidecar stay for a resume
                 }
                 emit(fetched.load(Ordering::Relaxed));
                 continue;
@@ -1114,9 +1582,13 @@ async fn download_one(
 
     // Every chunk arrived at its full length, so the file is complete. Its size
     // proves nothing on its own: `.part` was created at full size.
+    // Marked before the rename, which carries the mark along: on Windows a final
+    // name ending in a dot or a space is trimmed by the rename, and a mark put on
+    // the untrimmed name afterwards would land on another, empty file.
+    mark_from_network(&part_path);
     fs::rename(&part_path, out_path).map_err(|e| e.to_string())?;
     let _ = fs::remove_file(&meta_path);
-    Ok(Outcome::Done)
+    Ok((Outcome::Done, Some(etag)))
 }
 
 /// Every object under a prefix, paged, as (key, size, etag).
@@ -1124,8 +1596,10 @@ async fn list_objects_all(
     client: &Client,
     bucket: &str,
     prefix: &str,
-) -> Result<Vec<(String, u64, String)>, String> {
+    cancel: &AtomicBool,
+) -> Result<Option<Vec<(String, u64, String)>>, String> {
     let mut out = Vec::new();
+    let mut guard = PageGuard::new(TREE_MAX_ENTRIES);
     // The SDK's paginator follows the continuation token and stops when it
     // repeats; it never looks at `is_truncated`.
     let mut pages = client
@@ -1134,8 +1608,18 @@ async fn list_objects_all(
         .prefix(prefix)
         .into_paginator()
         .send();
-    while let Some(page) = pages.next().await {
+    loop {
+        // A cancel does not wait for the page on its way: a page can take seconds.
+        let page = tokio::select! {
+            biased;
+            () = canceled(cancel) => return Ok(None),
+            page = pages.next() => page,
+        };
+        let Some(page) = page else { break };
         let resp = page.map_err(|e| s3_err(&e))?;
+        guard
+            .page(resp.contents().len(), resp.next_continuation_token())
+            .map_err(|stop| stop.to_string())?;
         for o in resp.contents() {
             if let Some(k) = o.key() {
                 out.push((
@@ -1146,7 +1630,14 @@ async fn list_objects_all(
             }
         }
     }
-    Ok(out)
+    Ok(Some(out))
+}
+
+/// Resolves once the job is canceled, looking every 200 ms.
+async fn canceled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Streams the chosen remote sources into one archive, member by member.
@@ -1159,7 +1650,7 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
     // The archive is built under a hidden name and takes its real one only when
     // complete. A `.zip` already sitting there is the user's own and is never
     // opened, resumed into or deleted.
-    let final_path = dest_root.join(&zip_name);
+    let final_path = join_name(&dest_root, &zip_name)?;
     let out_path = dot_sibling(&final_path, ".part");
 
     // Members as (remote key, path inside the archive, size, etag).
@@ -1173,29 +1664,24 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
                 .next()
                 .unwrap_or("")
                 .to_string();
-            for (key, sz, etag) in list_objects_all(&client, &bucket, &prefix).await? {
-                if key.ends_with("/.keep") {
+            let Some(listed) = list_objects_all(&client, &bucket, &prefix, &job.cancel).await? else {
+                return Ok(Outcome::Canceled);
+            };
+            for (key, sz, etag) in listed {
+                // Folder markers carry no data; a folder is in the archive through its files.
+                if key.ends_with("/.keep") || key.ends_with('/') {
                     continue;
                 }
                 let rel = key.strip_prefix(&prefix).unwrap_or(&key);
                 if rel.is_empty() {
                     continue;
                 }
-                // The archive is extracted by some other tool later, so a member
-                // name that climbs out of the archive is refused here too.
-                if !safe_rel(rel) {
-                    return Err(format!("unsafe path in object name: {rel}"));
-                }
-                let arc = if top.is_empty() {
-                    rel.to_string()
-                } else {
-                    format!("{top}/{rel}")
-                };
+                let arc = zip_member(&top, rel)?;
                 members.push((key, arc, sz, etag));
             }
         } else {
             let key = remote_key(&zs.path);
-            let name = key.rsplit('/').next().unwrap_or(&key).to_string();
+            let name = zip_member("", key.rsplit('/').next().unwrap_or(&key))?;
             let head = client
                 .head_object()
                 .bucket(&bucket)
@@ -1214,36 +1700,26 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
 
     let grand_total: u64 = members.iter().map(|(_, _, s, _)| *s).sum();
 
-    // A zip is resumable: members already inside the archive with the right size are skipped,
-    // and before each new member the archive is copied to a `.ckpt` file it can be restored from.
-    let ckpt = dot_sibling(&final_path, ".ckpt");
-
-    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if out_path.exists() {
-        if let Ok(existing) = fs::File::open(&out_path)
-            && let Ok(mut ar) = zip::ZipArchive::new(existing)
-        {
-            for (_, arc_name, sz, _) in &members {
-                if ar.by_name(arc_name).is_ok_and(|e| e.size() == *sz) {
-                    done.insert(arc_name.clone());
-                }
-            }
-        }
-        if done.is_empty() {
-            let _ = fs::remove_file(&out_path); // leftover that matches nothing
-        }
-    }
-    if !out_path.exists() {
-        // A fresh run starts from an empty but valid archive, so the loop below has only one path.
-        zip::ZipWriter::new(fs::File::create(&out_path).map_err(|e| e.to_string())?)
-            .finish()
-            .map_err(|e| e.to_string())?;
-    }
-    let _ = fs::remove_file(&ckpt); // may be left over from an earlier run
-
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored)
-        .large_file(true);
+    // A zip is resumable: an archive this run's writer left keeps the members
+    // whose name, size and ETag still match, and the run goes on after them.
+    // Anything else in its place is thrown away and the archive starts over.
+    let _ = fs::remove_file(dot_sibling(&final_path, ".ckpt")); // left by 1.1 and earlier
+    clear_link(&out_path).map_err(|e| e.to_string())?;
+    let wanted: HashMap<&str, (u64, &str)> = members
+        .iter()
+        .map(|(_, arc, sz, etag)| (arc.as_str(), (*sz, etag.as_str())))
+        .collect();
+    let resumed = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&out_path)
+        .ok()
+        .and_then(|f| ZipOut::resume(f, |name, size, etag| wanted.get(name) == Some(&(size, etag))));
+    let mut out = match resumed {
+        Some(out) => out,
+        None => ZipOut::create(create_side(&out_path).map_err(|e| e.to_string())?),
+    };
+    let done: std::collections::HashSet<String> = out.names().map(str::to_string).collect();
 
     let clock = Instant::now();
     // On a resume the already archived members count as progress from the start.
@@ -1260,56 +1736,24 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
             continue; // this member is already in the archive
         }
         if job.cancel.load(Ordering::Relaxed) {
+            // Every whole member stays, for a resume.
+            out.finish().map_err(|e| e.to_string())?;
             return Ok(Outcome::Canceled);
         }
-
-        // Save the still-valid archive before touching it.
-        fs::copy(&out_path, &ckpt).map_err(|e| e.to_string())?;
-        let restore = |out: &std::path::Path, ckpt: &std::path::Path| {
-            let _ = fs::copy(ckpt, out);
-        };
-
-        let f = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&out_path)
-            .map_err(|e| e.to_string())?;
-        let mut zip = match zip::ZipWriter::new_append(f) {
-            Ok(z) => z,
-            Err(e) => {
-                restore(&out_path, &ckpt);
-                return Err(e.to_string());
-            }
-        };
-        if let Err(e) = zip.start_file(arc_name.as_str(), opts) {
-            drop(zip);
-            restore(&out_path, &ckpt);
-            return Err(e.to_string());
-        }
+        out.start(arc_name, etag).map_err(|e| e.to_string())?;
 
         let total = *sz;
         let mut off: u64 = 0;
-        let mut canceled = false;
         while off < total {
             if job.cancel.load(Ordering::Relaxed) {
-                canceled = true;
-                break;
+                return Ok(Outcome::Canceled); // dropping `out` cuts the half member away
             }
             let end = (off + CHUNK).min(total) - 1;
             let etag = (!etag.is_empty()).then_some(etag.as_str());
-            let data = match get_range_retry(app, &job.id, &client, &bucket, key, off, end, etag, &job.cancel).await {
-                Ok(d) => d,
-                Err(e) => {
-                    drop(zip);
-                    restore(&out_path, &ckpt);
-                    return Err(e);
-                }
-            };
-            if let Err(e) = zip.write_all(&data) {
-                drop(zip);
-                restore(&out_path, &ckpt);
-                return Err(e.to_string());
-            }
+            let data =
+                get_range_retry(app, &job.id, &client, &bucket, key, off, end, etag, &job.cancel)
+                    .await?;
+            out.write(&data).map_err(|e| e.to_string())?;
             off += data.len() as u64;
             written += data.len() as u64;
             if last_emit.elapsed() >= EMIT_EVERY {
@@ -1324,22 +1768,13 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
                 last_emit = Instant::now();
             }
         }
-
-        if canceled {
-            drop(zip); // no finish: this member is half written
-            restore(&out_path, &ckpt);
-            let _ = fs::remove_file(&ckpt);
-            return Ok(Outcome::Canceled);
-        }
-        if let Err(e) = zip.finish() {
-            restore(&out_path, &ckpt);
-            return Err(e.to_string());
-        }
+        out.end_member().map_err(|e| e.to_string())?;
     }
+    drop(out.finish().map_err(|e| e.to_string())?);
 
-    let _ = fs::remove_file(&ckpt);
     // A name taken in the meantime, or from the start, gets the next " copy" name.
     let name = free_local_name(&dest_root, &zip_name);
+    mark_from_network(&out_path); // before the rename, as in `download_one`
     fs::rename(&out_path, dest_root.join(&name)).map_err(|e| e.to_string())?;
     emit_progress(app, &job.id, grand_total, grand_total, 0);
     Ok(Outcome::Done)
@@ -1364,23 +1799,29 @@ async fn run_local_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
     }
 
     // A move inside one filesystem is a rename: instant, and it never needs twice the space.
-    if is_move && !dest.exists() && fs::rename(&src, &dest).is_ok() {
+    // A source chosen through a link is copied instead, so its content arrives on
+    // every disk alike and only the link is removed afterwards.
+    if is_move && !is_link(&src) && !dest.exists() && fs::rename(&src, &dest).is_ok() {
         emit_progress(app, &job.id, 1, 1, 0);
         return Ok(Outcome::Done);
     }
 
     if job.is_dir {
         fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-        let (files, empty_dirs) = walk_files(&src)?;
+        let Some(walk) = walk_files(&src, &job.cancel)? else {
+            return Ok(Outcome::Canceled);
+        };
+        let (files, empty_dirs) = (&walk.files, &walk.empty_dirs);
         // Empty subfolders are created explicitly; walking only files would lose them.
-        for d in &empty_dirs {
+        for d in empty_dirs {
             fs::create_dir_all(dest.join(d)).map_err(|e| e.to_string())?;
         }
         let total: u64 = files.iter().map(|(_, sz, _)| *sz).sum();
         let clock = Instant::now();
         let mut done: u64 = 0;
+        let mut changed: Vec<String> = Vec::new();
         emit_progress(app, &job.id, 0, total, 0);
-        for (path, sz, rel) in &files {
+        for (path, sz, rel) in files {
             if job.cancel.load(Ordering::Relaxed) {
                 return Ok(Outcome::Canceled);
             }
@@ -1400,18 +1841,26 @@ async fn run_local_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
                 Some((done, total, clock)),
                 &job.conflict,
             )? {
-                Outcome::Canceled => return Ok(Outcome::Canceled),
-                Outcome::Done => job.sent_local.lock().unwrap().push(path.clone()),
-                Outcome::Skipped(_) => {}
+                (Outcome::Canceled, _) => return Ok(Outcome::Canceled),
+                (Outcome::Done, stamp) => job.sent_local.lock().unwrap().push((path.clone(), stamp)),
+                // A file that changed while it was read stays out and is named in the note.
+                (Outcome::Skipped(why), _) if why == CHANGED => changed.push(rel.clone()),
+                (Outcome::Skipped(_), _) => {}
             }
             done += *sz;
         }
         emit_progress(app, &job.id, total, total, 0);
+        emit_skipped(app, &job.id, &job.name, &LeftOut { changed, ..LeftOut::of_walk(&walk) });
         Ok(Outcome::Done)
     } else {
         let total = fs::metadata(&src).map_err(|e| e.to_string())?.len();
         emit_progress(app, &job.id, 0, total, 0);
-        copy_file_chunked(app, &job.id, &job.cancel, &src, &dest, None, &job.conflict)
+        let (outcome, stamp) =
+            copy_file_chunked(app, &job.id, &job.cancel, &src, &dest, None, &job.conflict)?;
+        if matches!(outcome, Outcome::Done) {
+            job.sent_local.lock().unwrap().push((src.clone(), stamp));
+        }
+        Ok(outcome)
     }
 }
 
@@ -1425,12 +1874,12 @@ fn copy_file_chunked(
     dst: &std::path::Path,
     agg: Agg,
     conflict: &str,
-) -> Result<Outcome, String> {
+) -> Result<(Outcome, Option<SourceStamp>), String> {
     use std::io::Read;
 
     let target: PathBuf = if dst.exists() {
         match conflict {
-            "skip" => return Ok(Outcome::Skipped(SKIP_TAKEN.into())),
+            "skip" => return Ok((Outcome::Skipped(SKIP_TAKEN.into()), None)),
             "rename" => {
                 let dir = dst.parent().map(|p| p.to_path_buf()).unwrap_or_default();
                 let nm = dst.file_name().and_then(|n| n.to_str()).unwrap_or("file");
@@ -1448,9 +1897,12 @@ fn copy_file_chunked(
     }
     let tmp = dot_sibling(dst, ".part");
     let mut reader = fs::File::open(src).map_err(|e| e.to_string())?;
-    let mut writer = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    // The stamp comes from the open file, before and after the copy: a file
+    // edited meanwhile is not taken, and a Move later deletes only this version.
+    let before = source_stamp(&reader.metadata().map_err(|e| e.to_string())?);
+    let mut writer = create_side(&tmp).map_err(|e| e.to_string())?;
 
-    let total = fs::metadata(src).map_err(|e| e.to_string())?.len();
+    let total = before.size;
     let (base, grand_total, clock) = agg.unwrap_or((0, total, Instant::now()));
     let started = Instant::now();
     let mut done: u64 = 0;
@@ -1461,7 +1913,7 @@ fn copy_file_chunked(
         if cancel.load(Ordering::Relaxed) {
             drop(writer);
             let _ = fs::remove_file(&tmp);
-            return Ok(Outcome::Canceled);
+            return Ok((Outcome::Canceled, None));
         }
         let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
         if n == 0 {
@@ -1483,8 +1935,13 @@ fn copy_file_chunked(
 
     writer.sync_data().ok();
     drop(writer);
+    let after = reader.metadata().map(|m| source_stamp(&m)).map_err(|e| e.to_string())?;
+    if after != before || done != before.size {
+        let _ = fs::remove_file(&tmp);
+        return Ok((Outcome::Skipped(CHANGED.into()), None));
+    }
     fs::rename(&tmp, dst).map_err(|e| e.to_string())?;
-    Ok(Outcome::Done)
+    Ok((Outcome::Done, Some(before)))
 }
 
 async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
@@ -1514,10 +1971,15 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
             return Ok(Outcome::Skipped(SKIP_SAME.into()));
         }
         // The result is passed through unchanged.
-        return remote_copy_stream(
+        let (outcome, etag) = remote_copy_stream(
             app, &client, &bucket, &src_key, &dest_key, &job.id, None, &job.cancel,
         )
-        .await;
+        .await
+        .map_err(|e| if e == ERR_SOURCE_CHANGED { format!("{src_key}: {e}") } else { e })?;
+        if matches!(outcome, Outcome::Done) {
+            job.sent_remote.lock().unwrap().push((src_key, etag));
+        }
+        return Ok(outcome);
     }
 
     // A folder copies every object under the prefix, `.keep` markers included.
@@ -1527,7 +1989,9 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
     if dest_prefix.starts_with(&src_prefix) {
         return Err(ERR_INTO_ITSELF.into());
     }
-    let objects = list_objects_all(&client, &bucket, &src_prefix).await?;
+    let Some(objects) = list_objects_all(&client, &bucket, &src_prefix, &job.cancel).await? else {
+        return Ok(Outcome::Canceled);
+    };
     let total: u64 = objects.iter().map(|(_, sz, _)| *sz).sum();
     let clock = Instant::now();
     let mut done: u64 = 0;
@@ -1536,15 +2000,15 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
     // With `skip`, an object already at the destination is left as it is and its
     // source is not counted as sent, the same as a folder download does.
     let taken: std::collections::HashSet<String> = if job.conflict == "skip" {
-        list_objects_all(&client, &bucket, &dest_prefix)
-            .await?
-            .into_iter()
-            .map(|(k, _, _)| k)
-            .collect()
+        let Some(listed) = list_objects_all(&client, &bucket, &dest_prefix, &job.cancel).await? else {
+            return Ok(Outcome::Canceled);
+        };
+        listed.into_iter().map(|(k, _, _)| k).collect()
     } else {
         std::collections::HashSet::new()
     };
 
+    let mut changed: Vec<String> = Vec::new();
     for (key, sz, _) in &objects {
         let rel = key.strip_prefix(&src_prefix).unwrap_or(key);
         let dest_key = format!("{dest_prefix}{rel}");
@@ -1552,6 +2016,10 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
             return Ok(Outcome::Canceled);
         }
         if rel.is_empty() {
+            // The folder's own marker is not copied; one that holds data must stay.
+            if *sz > 0 {
+                job.keep_remote.lock().unwrap().push(key.clone());
+            }
             continue;
         }
         if taken.contains(&dest_key) {
@@ -1563,15 +2031,19 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
             app, &client, &bucket, key, &dest_key, &job.id,
             Some((done, total, clock)), &job.cancel,
         )
-        .await?
+        .await
         {
-            Outcome::Canceled => return Ok(Outcome::Canceled),
-            Outcome::Done => job.sent_remote.lock().unwrap().push(key.clone()),
-            Outcome::Skipped(_) => {}
+            Ok((Outcome::Canceled, _)) => return Ok(Outcome::Canceled),
+            Ok((Outcome::Done, etag)) => job.sent_remote.lock().unwrap().push((key.clone(), etag)),
+            Ok((Outcome::Skipped(_), _)) => {}
+            // One object written again meanwhile is left out and named; the rest still goes.
+            Err(e) if e == ERR_SOURCE_CHANGED => changed.push(rel.to_string()),
+            Err(e) => return Err(e),
         }
         done += *sz;
     }
     emit_progress(app, &job.id, total, total, 0);
+    emit_skipped(app, &job.id, &job.name, &LeftOut { changed, ..Default::default() });
     Ok(Outcome::Done)
 }
 
@@ -1602,24 +2074,67 @@ where
 /// Largest object `CopyObject` copies in one request, per the S3 limit.
 const COPY_OBJECT_MAX: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Server-side copy of one object, checked by size afterwards.
+/// Server-side copy of one object, bound to the version with `etag` and
+/// checked by size afterwards. A source replaced meanwhile fails with
+/// `ERR_SOURCE_CHANGED`.
 async fn copy_object_checked(
     client: &Client,
     bucket: &str,
     src_key: &str,
     dest_key: &str,
     total: u64,
+    etag: &str,
 ) -> Result<(), String> {
     // The source goes unencoded: the gateway looks the header up as written.
-    client
+    let version = (!etag.is_empty()).then(|| etag.to_string());
+    match client
         .copy_object()
         .bucket(bucket)
         .key(dest_key)
         .copy_source(format!("{bucket}/{src_key}"))
+        .set_copy_source_if_match(version)
         .send()
         .await
-        .map_err(|e| s3_err(&e))?;
+    {
+        Ok(_) => {}
+        Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 412) => {
+            return Err(ERR_SOURCE_CHANGED.into());
+        }
+        Err(e) => return Err(s3_err(&e)),
+    }
     verify_object_size(client, bucket, dest_key, total).await
+}
+
+/// The server-side copy, tried once more when the source changed between the
+/// HEAD and the copy: the copy is atomic, so the new version arrives whole, and
+/// its ETag is what a Move later deletes. Returns that ETag.
+async fn server_copy(
+    client: &Client,
+    bucket: &str,
+    src_key: &str,
+    dest_key: &str,
+    total: u64,
+    etag: &str,
+) -> Result<String, String> {
+    match copy_object_checked(client, bucket, src_key, dest_key, total, etag).await {
+        Err(e) if e == ERR_SOURCE_CHANGED => {}
+        other => return other.map(|()| etag.to_string()),
+    }
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(src_key)
+        .send()
+        .await
+        .map_err(|e| format!("HEAD {src_key}: {}", s3_err(&e)))?;
+    let (total, etag) = (
+        head.content_length().unwrap_or(0).max(0) as u64,
+        head.e_tag().unwrap_or_default().to_string(),
+    );
+    if total > COPY_OBJECT_MAX {
+        return Err(ERR_SOURCE_CHANGED.into());
+    }
+    copy_object_checked(client, bucket, src_key, dest_key, total, &etag).await.map(|()| etag)
 }
 
 /// Copies one object inside the bucket: on the server with `CopyObject` when it
@@ -1638,11 +2153,15 @@ async fn remote_copy_stream(
     id: &str,
     agg: Agg,
     cancel: &AtomicBool,
-) -> Result<Outcome, String> {
+) -> Result<(Outcome, Option<String>), String> {
     let head = retry3(|| client.head_object().bucket(bucket).key(src_key).send())
         .await
         .map_err(|e| format!("HEAD {src_key}: {}", s3_err(&e)))?;
     let total = head.content_length().unwrap_or(0).max(0) as u64;
+    // Everything below reads this version: the copy and every range are bound
+    // to it, so a source replaced meanwhile fails instead of arriving mixed.
+    let etag = head.e_tag().unwrap_or_default().to_string();
+    let version = (!etag.is_empty()).then_some(etag.as_str());
     let (base, grand_total, clock) = agg.unwrap_or((0, total, Instant::now()));
 
     if total == 0 {
@@ -1657,18 +2176,20 @@ async fn remote_copy_stream(
         .await
         .map_err(|e| format!("PUT {dest_key}: {}", s3_err(&e)))?;
         emit_progress(app, id, base, grand_total, 0);
-        return Ok(Outcome::Done);
+        return Ok((Outcome::Done, Some(etag.clone())));
     }
 
     if total <= COPY_OBJECT_MAX {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(Outcome::Canceled);
+            return Ok((Outcome::Canceled, None));
         }
-        match copy_object_checked(client, bucket, src_key, dest_key, total).await {
-            Ok(()) => {
+        match server_copy(client, bucket, src_key, dest_key, total, &etag).await {
+            Ok(copied) => {
                 emit_progress(app, id, base + total, grand_total, 0);
-                return Ok(Outcome::Done);
+                return Ok((Outcome::Done, Some(copied)));
             }
+            // Reading it through the app would only copy the new version.
+            Err(e) if e == ERR_SOURCE_CHANGED => return Err(e),
             Err(e) => crate::devlog::verbose(
                 "transfer",
                 format!(
@@ -1679,13 +2200,12 @@ async fn remote_copy_stream(
     }
 
     if total <= CHUNK {
-        let obj = retry3(|| client.get_object().bucket(bucket).key(src_key).send())
+        let data = get_range_retry(app, id, client, bucket, src_key, 0, total - 1, version, cancel)
             .await
-            .map_err(|e| format!("GET {src_key}: {}", s3_err(&e)))?;
-        let data = obj.body.collect().await.map_err(|e| e.to_string())?.into_bytes();
+            .map_err(|e| if e == ERR_CHANGED { ERR_SOURCE_CHANGED.to_string() } else { e })?;
         put_object_verified(client, bucket, dest_key, &data).await?;
         emit_progress(app, id, base + total, grand_total, 0);
-        return Ok(Outcome::Done);
+        return Ok((Outcome::Done, Some(etag.clone())));
     }
 
     // Larger objects go part by part; the part size keeps S3's 10.000 part limit.
@@ -1710,31 +2230,32 @@ async fn remote_copy_stream(
     let started = Instant::now();
     let mut last_emit = Instant::now() - EMIT_EVERY;
 
+    // A part that fails leaves nothing half-made on the server.
+    let abort = || async {
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(dest_key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+    };
     for pn in 1..=num_parts {
         if cancel.load(Ordering::Relaxed) {
-            let _ = client
-                .abort_multipart_upload()
-                .bucket(bucket)
-                .key(dest_key)
-                .upload_id(&upload_id)
-                .send()
-                .await;
-            return Ok(Outcome::Canceled);
+            abort().await;
+            return Ok((Outcome::Canceled, None));
         }
         let off = (pn as u64 - 1) * part_size;
         let end = (off + part_size).min(total) - 1;
-        let range = format!("bytes={off}-{end}");
-        let obj = retry3(|| {
-            client
-                .get_object()
-                .bucket(bucket)
-                .key(src_key)
-                .range(&range)
-                .send()
-        })
-        .await
-        .map_err(|e| format!("GET {src_key} {range}: {}", s3_err(&e)))?;
-        let data = obj.body.collect().await.map_err(|e| e.to_string())?.into_bytes();
+        // The same read as a download's: bound to the version, retried, and
+        // refused unless exactly the range comes back.
+        let data = match get_range_retry(app, id, client, bucket, src_key, off, end, version, cancel).await {
+            Ok(d) => d,
+            Err(e) => {
+                abort().await;
+                return Err(if e == ERR_CHANGED { ERR_SOURCE_CHANGED.to_string() } else { e });
+            }
+        };
         let n = data.len() as u64;
         let out = retry3(|| {
             client
@@ -1746,8 +2267,14 @@ async fn remote_copy_stream(
                 .body(ByteStream::from(data.to_vec()))
                 .send()
         })
-        .await
-        .map_err(|e| format!("UploadPart {dest_key} #{pn}: {}", s3_err(&e)))?;
+        .await;
+        let out = match out {
+            Ok(o) => o,
+            Err(e) => {
+                abort().await;
+                return Err(format!("UploadPart {dest_key} #{pn}: {}", s3_err(&e)));
+            }
+        };
         parts.push(
             CompletedPart::builder()
                 .part_number(pn)
@@ -1770,7 +2297,7 @@ async fn remote_copy_stream(
     let completed = CompletedMultipartUpload::builder()
         .set_parts(Some(parts))
         .build();
-    retry3(|| {
+    if let Err(e) = retry3(|| {
         client
             .complete_multipart_upload()
             .bucket(bucket)
@@ -1780,10 +2307,21 @@ async fn remote_copy_stream(
             .send()
     })
     .await
-    .map_err(|e| format!("CompleteMultipartUpload {dest_key}: {}", s3_err(&e)))?;
+    {
+        abort().await;
+        return Err(format!("CompleteMultipartUpload {dest_key}: {}", s3_err(&e)));
+    }
     verify_object_size(client, bucket, dest_key, total).await?;
-    Ok(Outcome::Done)
+    Ok((Outcome::Done, Some(etag.clone())))
 }
+
+/// A local source file that reached the destination, with the stamp it had
+/// when it was read: a Move deletes it only while it still has that stamp.
+type Sent = (PathBuf, Option<SourceStamp>);
+
+/// A remote source object that reached the destination, with the ETag of the
+/// version read: a Move deletes that version and no newer one.
+type SentRemote = (String, Option<String>);
 
 /// Sidecar next to an uploaded file; lets a later run continue the same multipart upload.
 #[derive(Serialize, Deserialize)]
@@ -1791,16 +2329,38 @@ struct UploadResume {
     key: String,
     upload_id: String,
     part_size: u64,
-    size: u64,
-    mtime: u64,
+    source: SourceStamp,
 }
 
-fn mtime_secs(meta: &fs::Metadata) -> u64 {
-    meta.modified()
+/// What a resumed upload is bound to: the file's size, its modification time to
+/// the nanosecond and its identity on disk. A file rewritten or replaced under
+/// the same name stops matching, even within the same second.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
+struct SourceStamp {
+    size: u64,
+    mtime_ns: u64,
+    /// The creation time in nanoseconds, or empty where it is not known.
+    id: String,
+}
+
+fn source_stamp(meta: &fs::Metadata) -> SourceStamp {
+    let mtime_ns = meta
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    SourceStamp { size: meta.len(), mtime_ns, id: file_identity(meta) }
+}
+
+/// When the file was created, as the file system keeps it: a file replaced
+/// under the same name has a new creation time. Empty where the system does
+/// not say, and the stamp then rests on size and modification time.
+fn file_identity(meta: &fs::Metadata) -> String {
+    meta.created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos().to_string())
+        .unwrap_or_default()
 }
 
 fn sidecar_of(src: &std::path::Path) -> PathBuf {
@@ -1845,15 +2405,22 @@ async fn run_upload(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
             }
             _ => format!("{dest_prefix}{name}"),
         };
-        return upload_one(
+        let (outcome, stamp) = upload_one(
             app, &client, &bucket, &key, &src_root, &job.id, &job.cancel, None,
         )
-        .await;
+        .await?;
+        if matches!(outcome, Outcome::Done) {
+            job.sent_local.lock().unwrap().push((src_root.clone(), stamp));
+        }
+        return Ok(outcome);
     }
 
     // A folder job walks the tree and uploads every file under the same relative path.
     let dest_prefix = format!("{}{}/", as_prefix(&job.dest_dir), name);
-    let (files, empty_dirs) = walk_files(&src_root)?;
+    let Some(walk) = walk_files(&src_root, &job.cancel)? else {
+        return Ok(Outcome::Canceled);
+    };
+    let (files, empty_dirs) = (&walk.files, &walk.empty_dirs);
     let total: u64 = files.iter().map(|(_, sz, _)| *sz).sum();
     let clock = Instant::now();
     let mut done: u64 = 0;
@@ -1863,16 +2430,16 @@ async fn run_upload(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
     // file is not counted as sent. That is also what lets a half-done folder
     // upload continue: an unfinished multipart upload is not an object yet.
     let existing: std::collections::HashSet<String> = if job.conflict == "skip" {
-        list_objects_all(&client, &bucket, &dest_prefix)
-            .await?
-            .into_iter()
-            .map(|(key, _, _)| key)
-            .collect()
+        let Some(listed) = list_objects_all(&client, &bucket, &dest_prefix, &job.cancel).await? else {
+            return Ok(Outcome::Canceled);
+        };
+        listed.into_iter().map(|(key, _, _)| key).collect()
     } else {
         std::collections::HashSet::new()
     };
 
-    for (path, sz, rel) in &files {
+    let mut changed: Vec<String> = Vec::new();
+    for (path, sz, rel) in files {
         let key = format!("{dest_prefix}{rel}");
         if job.cancel.load(Ordering::Relaxed) {
             return Ok(Outcome::Canceled);
@@ -1889,14 +2456,15 @@ async fn run_upload(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
         )
         .await?
         {
-            Outcome::Canceled => return Ok(Outcome::Canceled),
-            Outcome::Done => job.sent_local.lock().unwrap().push(path.clone()),
-            Outcome::Skipped(_) => {}
+            (Outcome::Canceled, _) => return Ok(Outcome::Canceled),
+            (Outcome::Done, stamp) => job.sent_local.lock().unwrap().push((path.clone(), stamp)),
+            // A file that changed while it was read stays out and is named in the note.
+            (Outcome::Skipped(_), _) => changed.push(rel.clone()),
         }
         done += *sz;
     }
     // Empty folders are represented by a `.keep` object, the same way New Folder does it.
-    for d in &empty_dirs {
+    for d in empty_dirs {
         let key = if d.is_empty() {
             format!("{dest_prefix}.keep")
         } else {
@@ -1911,23 +2479,59 @@ async fn run_upload(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
             .await;
     }
     emit_progress(app, &job.id, total, total, 0);
+    emit_skipped(app, &job.id, &job.name, &LeftOut { changed, ..LeftOut::of_walk(&walk) });
     Ok(Outcome::Done)
 }
 
-/// Walks a directory tree: every file as (path, size, relative path), plus the empty folders.
-type WalkResult = (Vec<(PathBuf, u64, String)>, Vec<String>);
-fn walk_files(root: &std::path::Path) -> Result<WalkResult, String> {
-    let mut out = Vec::new();
-    let mut empty_dirs = Vec::new();
+/// A walked directory tree, and what was left out of it on purpose.
+struct Walk {
+    /// Every file as (path, size, path relative to the root).
+    files: Vec<(PathBuf, u64, String)>,
+    /// Leaf folders with nothing to send, relative to the root.
+    empty_dirs: Vec<String>,
+    /// Symbolic links inside the tree: neither followed nor sent.
+    skipped_links: usize,
+    /// Relative paths, shown lossily, of items whose names are not valid UTF-8.
+    skipped_names: Vec<String>,
+}
+
+/// Walks the tree under `root`; `None` when the job is canceled meanwhile.
+fn walk_files(root: &std::path::Path, cancel: &AtomicBool) -> Result<Option<Walk>, String> {
+    let mut walk = Walk {
+        files: Vec::new(),
+        empty_dirs: Vec::new(),
+        skipped_links: 0,
+        skipped_names: Vec::new(),
+    };
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, rel_dir)) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         let rd = fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let mut any_entry = false;
         for item in rd.flatten() {
-            any_entry = true;
             let p = item.path();
-            let Ok(meta) = item.metadata() else { continue };
-            let name = item.file_name().to_string_lossy().into_owned();
+            let meta = item.metadata();
+            // A link inside the tree could lead anywhere, so it is left out. The
+            // folder the user chose may itself be a link; that one is followed.
+            if meta.as_ref().is_ok_and(|m| m.file_type().is_symlink()) {
+                walk.skipped_links += 1;
+                continue;
+            }
+            // A remote key is text: a name that is not valid UTF-8 cannot travel
+            // under its own name, and two such names could land on one key.
+            let Some(name) = item.file_name().to_str().map(str::to_owned) else {
+                let lossy = item.file_name().to_string_lossy().into_owned();
+                walk.skipped_names.push(if rel_dir.is_empty() {
+                    lossy
+                } else {
+                    format!("{rel_dir}/{lossy}")
+                });
+                continue;
+            };
+            any_entry = true;
+            let Ok(meta) = meta else { continue };
             let child_rel = if rel_dir.is_empty() {
                 name
             } else {
@@ -1944,16 +2548,139 @@ fn walk_files(root: &std::path::Path) -> Result<WalkResult, String> {
             ) {
                 continue;
             }
-            out.push((p, meta.len(), child_rel));
+            walk.files.push((p, meta.len(), child_rel));
         }
         if !any_entry {
-            empty_dirs.push(rel_dir);
+            walk.empty_dirs.push(rel_dir);
         }
     }
-    Ok((out, empty_dirs))
+    Ok(Some(walk))
 }
 
-/// Uploads one file, in parts, continuing an earlier attempt when the sidecar matches.
+/// What a folder job left out on purpose, for the note after it.
+#[derive(Default)]
+struct LeftOut {
+    /// Symbolic links inside the tree.
+    links: usize,
+    /// Names that are not valid UTF-8.
+    bad_names: Vec<String>,
+    /// Items written again while they were being read.
+    changed: Vec<String>,
+    /// Folder markers that hold data.
+    held: Vec<String>,
+}
+
+impl LeftOut {
+    fn of_walk(walk: &Walk) -> Self {
+        LeftOut { links: walk.skipped_links, bad_names: walk.skipped_names.clone(), ..Default::default() }
+    }
+}
+
+/// A few names and how many more, for a note.
+fn some_names(names: &[String]) -> String {
+    let shown: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
+    let more = names.len() - shown.len();
+    let tail = if more > 0 { format!(" and {more} more") } else { String::new() };
+    format!("{}{tail}", shown.join(", "))
+}
+
+/// Tells the interface what a folder job left out on purpose; it becomes a toast.
+fn emit_skipped(app: &AppHandle, id: &str, name: &str, left: &LeftOut) {
+    let mut parts = Vec::new();
+    if left.links > 0 {
+        parts.push(format!("{} symbolic link(s) not transferred", left.links));
+    }
+    if !left.bad_names.is_empty() {
+        parts.push(format!("not transferred, the name is not valid UTF-8: {}", some_names(&left.bad_names)));
+    }
+    if !left.changed.is_empty() {
+        parts.push(format!("not transferred, changed while being sent: {}", some_names(&left.changed)));
+    }
+    if !left.held.is_empty() {
+        parts.push(format!("not transferred, a folder marker that holds data: {}", some_names(&left.held)));
+    }
+    if parts.is_empty() {
+        return;
+    }
+    let detail = parts.join("; ");
+    crate::devlog::verbose("transfer", format!("note {id} {detail}"));
+    let _ = app.emit(
+        "transfer-note",
+        NoteEvt { id: id.to_string(), name: name.to_string(), detail },
+    );
+}
+
+/// Why an upload leaves a file out: it changed while it was being read.
+const CHANGED: &str = "the file changed while it was being sent, so it was not sent";
+
+/// Drops an upload whose file changed while it went up: its record goes, and
+/// the parts on the server with it.
+async fn drop_changed_upload(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    sidecar: &Path,
+) {
+    let _ = fs::remove_file(sidecar);
+    let aborted = client
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await;
+    let result = aborted.map_or_else(|e| s3_err(&e), |_| "done".to_string());
+    crate::devlog::verbose("transfer", format!("unfinished upload of {key} aborted: {result}"));
+}
+
+/// The key and upload named by a resume record of any version.
+#[derive(Deserialize)]
+struct RecordedUpload {
+    key: String,
+    upload_id: String,
+}
+
+/// Drops the upload an earlier attempt left for this key: its record goes, and
+/// its parts on the server with it, since they hold content this upload does
+/// not continue. The upload behind a record for another key is not aborted,
+/// since it may be running in another window of the app; this upload's record
+/// takes its place.
+async fn drop_earlier_attempt(client: &Client, bucket: &str, key: &str, sidecar: &Path) {
+    let Ok(text) = fs::read_to_string(sidecar) else {
+        return;
+    };
+    if let Ok(old) = serde_json::from_str::<RecordedUpload>(&text)
+        && old.key == key
+    {
+        drop_changed_upload(client, bucket, key, &old.upload_id, sidecar).await;
+    }
+}
+
+/// The sidecar's record when it still describes this file going to this key;
+/// otherwise an earlier attempt for this key is dropped.
+async fn usable_resume(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    source: &SourceStamp,
+    sidecar: &Path,
+) -> Option<UploadResume> {
+    let text = fs::read_to_string(sidecar).ok()?;
+    if let Ok(r) = serde_json::from_str::<UploadResume>(&text)
+        && r.key == key
+        && &r.source == source
+    {
+        return Some(r);
+    }
+    drop_earlier_attempt(client, bucket, key, sidecar).await;
+    None
+}
+
+/// Uploads one file, in parts, continuing an earlier attempt when the sidecar
+/// matches. A file sent in full comes back with the stamp it was read under, so
+/// a Move can tell it was replaced since; one that changed while it was read is
+/// skipped.
 #[allow(clippy::too_many_arguments)]
 async fn upload_one(
     app: &AppHandle,
@@ -1964,13 +2691,14 @@ async fn upload_one(
     id: &str,
     cancel: &AtomicBool,
     agg: Agg,
-) -> Result<Outcome, String> {
+) -> Result<(Outcome, Option<SourceStamp>), String> {
     use std::io::{Read, Seek, SeekFrom};
 
     let meta = fs::metadata(src).map_err(|e| e.to_string())?;
     let total = meta.len();
-    let mtime = mtime_secs(&meta);
     let sidecar = sidecar_of(src);
+    // The resume record is read and written only as a plain file (N4).
+    clear_link(&sidecar).map_err(|e| e.to_string())?;
 
     let (base, grand_total, clock) = agg.unwrap_or((0, total, Instant::now()));
 
@@ -1984,48 +2712,61 @@ async fn upload_one(
             .send()
             .await
             .map_err(|e| s3_err(&e))?;
+        drop_earlier_attempt(client, bucket, key, &sidecar).await;
         emit_progress(app, id, base, grand_total, 0);
-        return Ok(Outcome::Done);
+        return Ok((Outcome::Done, Some(source_stamp(&meta))));
     }
 
     // A small file goes in one verified request; splitting it would cost three and gain nothing.
     if total <= CHUNK {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(Outcome::Canceled);
+            return Ok((Outcome::Canceled, None));
         }
-        let data = fs::read(src).map_err(|e| e.to_string())?;
-        if data.len() as u64 != total {
-            return Err(format!("{}: size changed during upload", src.display()));
+        // Read through one open file, stamped before and after, so a change
+        // during the read is seen.
+        let mut file = fs::File::open(src).map_err(|e| format!("{}: {e}", src.display()))?;
+        let before = source_stamp(&file.metadata().map_err(|e| e.to_string())?);
+        let mut data = Vec::with_capacity(total as usize);
+        (&mut file)
+            .take(total + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| format!("{}: {e}", src.display()))?;
+        let after = source_stamp(&file.metadata().map_err(|e| e.to_string())?);
+        if data.len() as u64 != total || before.size != total || after != before {
+            return Ok((Outcome::Skipped(CHANGED.into()), None));
         }
         put_object_verified(client, bucket, key, &data).await?;
-        // A sidecar from an earlier multipart attempt is now meaningless.
-        let _ = fs::remove_file(&sidecar);
+        // An earlier multipart attempt, when the file was larger, is over.
+        drop_earlier_attempt(client, bucket, key, &sidecar).await;
         emit_progress(app, id, base + total, grand_total, 0);
-        return Ok(Outcome::Done);
+        return Ok((Outcome::Done, Some(before)));
     }
 
     let default_part = std::cmp::max(CHUNK, total.div_ceil(10_000));
 
-    let resumed: Option<UploadResume> = fs::read_to_string(&sidecar)
-        .ok()
-        .and_then(|s| serde_json::from_str::<UploadResume>(&s).ok())
-        .filter(|r| r.key == key && r.size == total && r.mtime == mtime);
+    // The stamp is read from the open file, so it describes the file the parts
+    // are read from.
+    let mut file = fs::File::open(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let source = source_stamp(&file.metadata().map_err(|e| e.to_string())?);
+    if source.size != total {
+        return Ok((Outcome::Skipped(CHANGED.into()), None));
+    }
+
+    let resumed = usable_resume(client, bucket, key, &source, &sidecar).await;
 
     let (upload_id, part_size, mut done) = match resumed {
         Some(r) => match list_parts_all(client, bucket, key, &r.upload_id).await {
             Ok(done) => (r.upload_id, r.part_size, done),
+            // The upload starts over, and the one it leaves goes with its record.
             Err(_) => {
-                let _ = fs::remove_file(&sidecar);
-                fresh_upload(client, bucket, key, default_part, total, mtime, &sidecar).await?
+                drop_changed_upload(client, bucket, key, &r.upload_id, &sidecar).await;
+                fresh_upload(client, bucket, key, default_part, &source, &sidecar).await?
             }
         },
-        None => {
-            fresh_upload(client, bucket, key, default_part, total, mtime, &sidecar).await?
-        }
+        None => fresh_upload(client, bucket, key, default_part, &source, &sidecar).await?,
     };
 
     let num_parts: i32 = total.div_ceil(part_size) as i32;
-    let mut file = fs::File::open(src).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; part_size as usize];
     let mut parts: Vec<CompletedPart> = Vec::new();
     let mut sent: u64 = 0;
@@ -2046,12 +2787,19 @@ async fn upload_one(
 
         if cancel.load(Ordering::Relaxed) {
             // No abort: the sidecar and the server-side upload stay, so this can continue
-            return Ok(Outcome::Canceled);
+            return Ok((Outcome::Canceled, None));
         }
 
-        file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
         let slice = &mut buf[..part_len as usize];
-        file.read_exact(slice).map_err(|e| e.to_string())?;
+        if let Err(e) = file.seek(SeekFrom::Start(offset)).and_then(|_| file.read_exact(slice)) {
+            // A file cut short meanwhile has changed; any other failure is
+            // reported with the file's name.
+            if file.metadata().is_ok_and(|m| source_stamp(&m) != source) {
+                drop_changed_upload(client, bucket, key, &upload_id, &sidecar).await;
+                return Ok((Outcome::Skipped(CHANGED.into()), None));
+            }
+            return Err(format!("{}: {e}", src.display()));
+        }
 
         // The SDK retries a failed part itself; the notice puts each retry in
         // the queue row and the log, the way a download's retries show.
@@ -2101,6 +2849,14 @@ async fn upload_one(
         }
     }
 
+    // A file edited while its parts went up is not completed: the parts would
+    // join two versions of it. The upload on the server goes with its record.
+    let now = source_stamp(&file.metadata().map_err(|e| e.to_string())?);
+    if now != source {
+        drop_changed_upload(client, bucket, key, &upload_id, &sidecar).await;
+        return Ok((Outcome::Skipped(CHANGED.into()), None));
+    }
+
     let completed = CompletedMultipartUpload::builder()
         .set_parts(Some(parts))
         .build();
@@ -2116,7 +2872,7 @@ async fn upload_one(
 
     let _ = fs::remove_file(&sidecar);
     verify_object_size(client, bucket, key, total).await?;
-    Ok(Outcome::Done)
+    Ok((Outcome::Done, Some(source)))
 }
 
 /// Makes the SDK's own retries of one upload part visible: each one shows in
@@ -2175,8 +2931,7 @@ async fn fresh_upload(
     bucket: &str,
     key: &str,
     part_size: u64,
-    size: u64,
-    mtime: u64,
+    source: &SourceStamp,
     sidecar: &std::path::Path,
 ) -> Result<(String, u64, HashMap<i32, String>), String> {
     let create = client
@@ -2194,10 +2949,9 @@ async fn fresh_upload(
         key: key.to_string(),
         upload_id: upload_id.clone(),
         part_size,
-        size,
-        mtime,
+        source: source.clone(),
     };
-    let _ = fs::write(sidecar, serde_json::to_string(&rec).unwrap_or_default());
+    write_side(sidecar, &serde_json::to_string(&rec).unwrap_or_default());
     Ok((upload_id, part_size, HashMap::new()))
 }
 
@@ -2238,6 +2992,8 @@ async fn list_parts_all(
 ) -> Result<HashMap<i32, String>, String> {
     let mut done = HashMap::new();
     let mut marker: Option<String> = None;
+    // S3 allows at most 10 000 parts to an upload.
+    let mut guard = PageGuard::new(10_000);
     loop {
         let mut req = client
             .list_parts()
@@ -2258,6 +3014,7 @@ async fn list_parts_all(
             resp.next_part_number_marker(),
             marker.as_deref(),
         );
+        guard.page(resp.parts().len(), marker.as_deref()).map_err(|stop| stop.to_string())?;
         if marker.is_none() {
             break;
         }
@@ -2266,9 +3023,7 @@ async fn list_parts_all(
 }
 
 // Multipart uploads that were never completed keep taking space on the volume, invisible in
-// the listing. They are swept at startup when old, or listed and aborted from Settings.
-
-const ORPHAN_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+// the listing. They are listed and aborted from Settings, only when the user confirms.
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -2296,6 +3051,7 @@ async fn list_multipart_uploads_all(
     let mut out = Vec::new();
     let mut key_marker: Option<String> = None;
     let mut id_marker: Option<String> = None;
+    let mut guard = PageGuard::new(TREE_MAX_ENTRIES);
     loop {
         let mut req = client.list_multipart_uploads().bucket(bucket);
         if let Some(k) = &key_marker {
@@ -2319,6 +3075,9 @@ async fn list_multipart_uploads_all(
             (key_marker.as_deref(), id_marker.as_deref()),
         ) {
             Some((k, i)) => {
+                // The two markers together name the page asked for next.
+                let token = format!("{k}\0{}", i.as_deref().unwrap_or(""));
+                guard.page(resp.uploads().len(), Some(&token)).map_err(|stop| stop.to_string())?;
                 key_marker = Some(k);
                 id_marker = i;
             }
@@ -2336,6 +3095,7 @@ async fn sum_parts_bytes(
 ) -> u64 {
     let mut total: u64 = 0;
     let mut marker: Option<String> = None;
+    let mut guard = PageGuard::new(10_000);
     loop {
         let mut req = client
             .list_parts()
@@ -2354,7 +3114,8 @@ async fn sum_parts_bytes(
             resp.next_part_number_marker(),
             marker.as_deref(),
         );
-        if marker.is_none() {
+        // The sum is only shown, so a server going in circles just ends it.
+        if marker.is_none() || guard.page(resp.parts().len(), marker.as_deref()).is_err() {
             break;
         }
     }
@@ -2403,45 +3164,6 @@ pub async fn abort_orphan_uploads(
     Ok(n)
 }
 
-/// Silently aborts uploads older than a week; runs in the background at startup.
-pub async fn sweep_old_orphans(app: AppHandle) {
-    let Ok((client, bucket)) = s3(&app) else {
-        return;
-    };
-    let Ok(ups) = list_multipart_uploads_all(&client, &bucket).await else {
-        return;
-    };
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let cutoff = now_ms - ORPHAN_MAX_AGE_SECS * 1000;
-    let mut n = 0;
-    for (key, upload_id, initiated_ms) in ups {
-        let Some(ms) = initiated_ms else { continue };
-        if ms >= cutoff {
-            continue;
-        }
-        if client
-            .abort_multipart_upload()
-            .bucket(&bucket)
-            .key(&key)
-            .upload_id(&upload_id)
-            .send()
-            .await
-            .is_ok()
-        {
-            n += 1;
-        }
-    }
-    if n > 0 {
-        crate::devlog::verbose(
-            "transfer",
-            format!("orphan multipart sweep: aborted {n} upload(s) older than 7 days"),
-        );
-    }
-}
-
 fn emit_progress(app: &AppHandle, id: &str, done: u64, total: u64, speed: u64) {
     let _ = app.emit(
         "transfer-progress",
@@ -2468,84 +3190,6 @@ fn emit_current_file(app: &AppHandle, id: &str, name: &str) {
         "transfer-file",
         FileEvt { id: id.to_string(), name: name.to_string() },
     );
-}
-
-#[cfg(test)]
-mod zip_resume_tests {
-    // Proves the zip resume mechanism without touching S3: an interrupted member is thrown
-    // away by restoring the checkpoint, and the archive stays readable.
-    use std::io::Write;
-
-    #[test]
-    fn checkpoint_copy_survives_interrupted_member() {
-        let dir = std::env::temp_dir().join(format!("bgzt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("t.zip");
-        let ckpt = dir.join(".t.zip.ckpt");
-
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-
-        // A fresh archive with one member.
-        let f = std::fs::File::create(&path).unwrap();
-        let mut zw = zip::ZipWriter::new(f);
-        zw.start_file("a.txt", opts).unwrap();
-        zw.write_all(b"hello-a").unwrap();
-        zw.finish().unwrap();
-
-        // Checkpoint, exactly as the real code does before each member.
-        std::fs::copy(&path, &ckpt).unwrap();
-
-        // A second member is left half written, as a cancel would leave it.
-        let f2 = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let mut zw2 = zip::ZipWriter::new_append(f2).unwrap();
-        zw2.start_file("b.txt", opts).unwrap();
-        zw2.write_all(b"partial-garbage-not-finished").unwrap();
-        drop(zw2); // no finish: the file is broken from here on
-
-        // Restore from the checkpoint.
-        std::fs::copy(&ckpt, &path).unwrap();
-
-        // The restored archive is valid again and holds only the finished member.
-        let check = std::fs::File::open(&path).unwrap();
-        let mut ar = zip::ZipArchive::new(check).unwrap();
-        assert_eq!(ar.len(), 1, "only the finished member survives a restore");
-        let mut a = ar.by_name("a.txt").unwrap();
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut a, &mut buf).unwrap();
-        assert_eq!(buf, "hello-a");
-        drop(a);
-        assert!(ar.by_name("b.txt").is_err(), "the half written member must be gone");
-        drop(ar);
-
-        // The resume then writes that member fully.
-        let f3 = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let mut zw3 = zip::ZipWriter::new_append(f3).unwrap();
-        zw3.start_file("b.txt", opts).unwrap();
-        zw3.write_all(b"hello-b").unwrap();
-        zw3.finish().unwrap();
-
-        // Both members are in the final archive with the right content.
-        let final_f = std::fs::File::open(&path).unwrap();
-        let mut ar2 = zip::ZipArchive::new(final_f).unwrap();
-        assert_eq!(ar2.len(), 2);
-        for (name, expect) in [("a.txt", "hello-a"), ("b.txt", "hello-b")] {
-            let mut entry = ar2.by_name(name).unwrap();
-            let mut s = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut s).unwrap();
-            assert_eq!(s, expect);
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 #[cfg(test)]
@@ -2629,19 +3273,19 @@ mod page_marker_tests {
 
 #[cfg(test)]
 mod name_tests {
-    use super::{as_prefix, dot_sibling, nth_copy, safe_join, safe_rel, split_for_copy};
+    use super::{as_prefix, dot_sibling, nth_copy, rel_parts, safe_join, split_for_copy};
     use std::path::Path;
 
     #[test]
     fn a_relative_path_that_climbs_out_is_refused() {
         for rel in ["../x", "a/../../x", "/tmp/x", "", "."] {
-            assert!(!safe_rel(rel), "{rel:?}");
+            assert!(rel_parts(rel, cfg!(windows)).is_none(), "{rel:?}");
             assert!(safe_join(Path::new("/dest"), rel).is_err(), "{rel:?}");
         }
         // A `.` between two names is dropped while the path is read, so the
         // result still lands inside the destination.
         for rel in ["x", "a/b/c.txt", "a b/.keep", "..a/b", "a..b", "a/./b"] {
-            assert!(safe_rel(rel), "{rel:?}");
+            assert!(rel_parts(rel, cfg!(windows)).is_some(), "{rel:?}");
         }
         assert_eq!(
             safe_join(Path::new("/dest"), "a/b.txt").unwrap(),
@@ -2785,7 +3429,7 @@ mod sent_files_tests {
             touch(f);
         }
 
-        remove_sent_files(&root, &[big.clone(), sub.clone()]).unwrap();
+        remove_sent_files(&root, &[(big.clone(), None), (sub.clone(), None)]).unwrap();
 
         assert!(!big.exists() && !sub.exists(), "sent files are deleted");
         assert!(added.exists(), "a file added meanwhile stays");
@@ -2804,10 +3448,818 @@ mod sent_files_tests {
         touch(&a);
         touch(&b);
 
-        remove_sent_files(&root, &[a, b]).unwrap();
+        remove_sent_files(&root, &[(a, None), (b, None)]).unwrap();
 
         assert!(!root.exists(), "the root goes when everything in it was sent");
         assert!(d.exists(), "nothing above the root is touched");
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod local_name_tests {
+    use super::{folder_item, is_local_name, join_name, zip_member};
+    use std::path::Path;
+
+    #[test]
+    fn a_remote_name_is_one_ordinary_name_on_every_system() {
+        for name in ["", ".", "..", "a/b", "/abs"] {
+            for windows in [false, true] {
+                assert!(!is_local_name(name, windows), "{name:?} windows={windows}");
+            }
+        }
+        // Outside Windows a backslash or a colon is an ordinary character.
+        for name in ["a.txt", "..a", "a..b", "models ", "x.", "a\\b", "C:x", "CON"] {
+            assert!(is_local_name(name, false), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn on_windows_a_name_cannot_change_what_the_path_points_at() {
+        for name in [
+            "a\\b", "\\x", "..\\x", "C:x", "C:\\x", "\\\\host\\share", "a:stream", "CON",
+            "con.txt", "NUL", "COM1", "lpt9.log", "...", " ", ". .", "a<b", "a|b", "a?", "a*",
+            "a\"b", "tab\t", "COM\u{b9}", "lpt\u{b2}.txt", "COM\u{b3} .log", "CONIN$", "conout$.txt",
+        ] {
+            assert!(!is_local_name(name, true), "{name:?}");
+        }
+        for name in ["a.txt", "..a", "models ", "x.", "CONSOLE", "COM10", "com0", "COM\u{b9}0", "CONIN", "Café menu.png"] {
+            assert!(is_local_name(name, true), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_downloaded_name_stays_in_its_folder() {
+        let root = Path::new("/dest");
+        assert_eq!(join_name(root, "a.txt").unwrap(), Path::new("/dest/a.txt"));
+        for name in ["..", "/etc", "a/b", "", "."] {
+            assert!(join_name(root, name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_zip_entry_cannot_climb_out_on_any_system() {
+        assert_eq!(zip_member("top", "a/b.txt").unwrap(), "top/a/b.txt");
+        assert_eq!(zip_member("", "a.txt").unwrap(), "a.txt");
+        assert_eq!(zip_member("top", "a/./b").unwrap(), "top/a/b");
+        // Names only Windows cannot store still go into an archive made elsewhere.
+        for (top, rel) in [("proj", "aux.py"), ("proj", "a?b.txt"), ("", "con.txt"), ("proj", "12:30.log")] {
+            assert!(zip_member(top, rel).is_ok(), "{top:?} + {rel:?}");
+        }
+        for (top, rel) in [
+            ("..", "x"),
+            ("top", "../x"),
+            ("top", "a\\..\\x"),
+            ("C:", "x"),
+            ("top", "C:x"),
+            ("top", "/x"),
+            ("", ".."),
+            ("a/b", "x"),
+            ("top", ""),
+        ] {
+            assert!(zip_member(top, rel).is_err(), "{top:?} + {rel:?}");
+        }
+    }
+
+    #[test]
+    fn a_folder_download_sorts_every_key_the_same_way() {
+        use super::FolderItem::{Dir, File, Held};
+        assert!(matches!(folder_item("m/", "m/a.bin", 5), Some(File("a.bin"))));
+        assert!(matches!(folder_item("m/", "m/sub/a.bin", 5), Some(File("sub/a.bin"))));
+        assert!(matches!(folder_item("m/", "m/sub/.keep", 0), Some(Dir("sub"))));
+        assert!(matches!(folder_item("m/", "m/sub/", 0), Some(Dir("sub"))));
+        assert!(matches!(folder_item("m/", "m/.keep", 0), Some(Dir(""))));
+        assert!(matches!(folder_item("m/", "m//.keep", 0), Some(Dir(""))));
+        assert!(folder_item("m/", "m/", 0).is_none());
+        // A marker that holds data is not a folder: the data arrives, or stays.
+        assert!(matches!(folder_item("m/", "m/sub/.keep", 2), Some(File("sub/.keep"))));
+        assert!(matches!(folder_item("m/", "m/sub/", 2), Some(Held("sub/"))));
+    }
+}
+
+#[cfg(test)]
+mod listing_guard_tests {
+    // A stand-in server lists pages as each test scripts them.
+    use super::list_objects_all;
+    use aws_sdk_s3::Client;
+    use aws_sdk_s3::primitives::SdkBody;
+    use aws_smithy_http_client::test_util::infallible_client_fn;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A client whose server answers ListObjectsV2 from `page`: given the
+    /// prefix and the continuation token asked for (empty for the first page),
+    /// it returns the keys, the folders and the next token. Requests are counted.
+    fn lister(
+        page: impl Fn(&str, &str) -> (Vec<String>, Vec<String>, Option<String>) + Send + Sync + 'static,
+    ) -> (Client, Arc<AtomicUsize>) {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        let http = infallible_client_fn(move |req: http::Request<SdkBody>| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let query = req.uri().query().unwrap_or("").to_string();
+            let param = |name: &str| {
+                query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix(name))
+                    .map(|v| percent_encoding::percent_decode_str(v).decode_utf8_lossy().to_string())
+                    .unwrap_or_default()
+            };
+            let (keys, dirs, next) = page(&param("prefix="), &param("continuation-token="));
+            let mut xml = String::from("<ListBucketResult><Name>b</Name>");
+            for k in keys {
+                xml += &format!("<Contents><Key>{k}</Key><Size>1</Size><ETag>\"e\"</ETag></Contents>");
+            }
+            for d in dirs {
+                xml += &format!("<CommonPrefixes><Prefix>{d}</Prefix></CommonPrefixes>");
+            }
+            match next {
+                Some(n) => xml += &format!("<IsTruncated>true</IsTruncated><NextContinuationToken>{n}</NextContinuationToken>"),
+                None => xml += "<IsTruncated>false</IsTruncated>",
+            }
+            xml += "</ListBucketResult>";
+            http::Response::builder().status(200).body(SdkBody::from(xml)).unwrap()
+        });
+        let (client, _) = crate::core::s3_client_from_parts(
+            "https://gateway.test", "eu-ro-1", "b", "AKIDTEST", "not-a-secret",
+        );
+        let conf = client.config().to_builder().http_client(http).build();
+        (Client::from_conf(conf), asked)
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_comes_round_again_fails() {
+        let (client, _) = lister(|_, token| match token {
+            "" => (vec!["p/1".into()], vec![], Some("A".into())),
+            "A" => (vec!["p/2".into()], vec![], Some("B".into())),
+            _ => (vec!["p/3".into()], vec![], Some("A".into())),
+        });
+        let got = tokio::time::timeout(Duration::from_secs(10), list_objects_all(&client, "b", "p/", &AtomicBool::new(false)))
+            .await
+            .expect("the listing ends");
+        assert!(got.is_err_and(|e| e.contains("page token")));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_stops_a_listing_that_never_ends() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let (client, asked) = lister(move |_, token| {
+            let n: u64 = token.parse().unwrap_or(0);
+            if n == 5 {
+                flag.store(true, Ordering::SeqCst);
+            }
+            (vec![format!("p/{n}")], vec![], Some((n + 1).to_string()))
+        });
+        let got = tokio::time::timeout(Duration::from_secs(10), list_objects_all(&client, "b", "p/", &cancel))
+            .await
+            .expect("the listing stops");
+        assert_eq!(got, Ok(None));
+        assert!(asked.load(Ordering::SeqCst) < 10, "stopped right after the cancel");
+    }
+}
+
+#[cfg(test)]
+mod conditional_tests {
+    // A stand-in server keeps each object at ETag "\"v1\"" and answers a
+    // condition on any other version with 412, as the RunPod gateway does. Keys
+    // named `gone*` are not there, `broken*` fail, `moved*` are at "\"v2\"".
+    use super::{
+        ERR_SOURCE_CHANGED, copy_object_checked, delete_remote_sources, delete_sent_object,
+        server_copy,
+    };
+    use aws_sdk_s3::Client;
+    use aws_sdk_s3::primitives::SdkBody;
+    use aws_smithy_http_client::test_util::infallible_client_fn;
+    use std::sync::{Arc, Mutex};
+
+    /// Every request as "METHOD path condition", where the condition is the
+    /// `If-Match` or `x-amz-copy-source-if-match` header, or "-".
+    fn server() -> (Client, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let http = infallible_client_fn(move |req: http::Request<SdkBody>| {
+            let header = |n: &str| req.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+            let cond = header("if-match").or_else(|| header("x-amz-copy-source-if-match"));
+            let copy_src = header("x-amz-copy-source").unwrap_or_default();
+            let path = req.uri().path().to_string();
+            log.lock().unwrap().push(format!("{} {path} {}", req.method(), cond.clone().unwrap_or("-".into())));
+            let subject = if copy_src.is_empty() { path.clone() } else { copy_src };
+            let now = if subject.contains("moved") { "\"v2\"" } else { "\"v1\"" };
+            let stale = cond.is_some_and(|c| c != now);
+            let method = req.method().as_str().to_string();
+            let (status, body) = match method.as_str() {
+                _ if subject.contains("broken") => (500, ""),
+                "HEAD" if subject.contains("gone") => (404, ""),
+                _ if stale => (412, ""),
+                "PUT" => (200, "<CopyObjectResult><ETag>\"v1\"</ETag></CopyObjectResult>"),
+                "HEAD" => (200, ""),
+                _ => (204, ""),
+            };
+            http::Response::builder()
+                .status(status)
+                .header("etag", now)
+                .header("content-length", if method == "HEAD" { "9" } else { "0" })
+                .body(SdkBody::from(body))
+                .unwrap()
+        });
+        let (client, _) = crate::core::s3_client_from_parts(
+            "https://gateway.test", "eu-ro-1", "b", "AKIDTEST", "not-a-secret",
+        );
+        let conf = client.config().to_builder().http_client(http).build();
+        (Client::from_conf(conf), seen)
+    }
+
+    #[tokio::test]
+    async fn a_copy_is_bound_to_the_version_it_names() {
+        let (client, seen) = server();
+        copy_object_checked(&client, "b", "a.bin", "c.bin", 9, "\"v1\"").await.unwrap();
+        assert!(seen.lock().unwrap()[0].ends_with("\"v1\""), "{:?}", seen.lock().unwrap());
+        let err = copy_object_checked(&client, "b", "a.bin", "c.bin", 9, "\"v0\"").await.unwrap_err();
+        assert_eq!(err, ERR_SOURCE_CHANGED);
+    }
+
+    // A source that changed between the HEAD and the copy is copied once more,
+    // at its new version, which is what a Move then deletes.
+    #[tokio::test]
+    async fn a_copy_tries_again_at_the_new_version() {
+        let (client, _) = server();
+        assert_eq!(server_copy(&client, "b", "moved.bin", "c.bin", 9, "\"v1\"").await, Ok("\"v2\"".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_move_deletes_only_the_version_it_sent() {
+        let (client, seen) = server();
+        assert_eq!(delete_sent_object(&client, "b", "a.bin", Some("\"v1\"")).await, Ok(true));
+        assert_eq!(delete_sent_object(&client, "b", "a.bin", Some("\"v0\"")).await, Ok(false), "a newer version stays");
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.iter().filter(|r| r.starts_with("DELETE")).all(|r| !r.ends_with(" -")), "every delete carries its version: {seen:?}");
+    }
+
+    // The gateway answers a key already gone with 412 as well: that one was deleted.
+    #[tokio::test]
+    async fn a_delete_that_finds_nothing_left_counts_as_done() {
+        let (client, _) = server();
+        assert_eq!(delete_sent_object(&client, "b", "gone.bin", Some("\"v0\"")).await, Ok(true));
+    }
+
+    // Without a version the request goes without a condition, as before.
+    #[tokio::test]
+    async fn no_version_means_no_condition() {
+        let (client, seen) = server();
+        delete_sent_object(&client, "b", "a.bin", None).await.unwrap();
+        delete_sent_object(&client, "b", "a.bin", Some("")).await.unwrap();
+        assert!(seen.lock().unwrap().iter().all(|r| r.ends_with(" -")), "{:?}", seen.lock().unwrap());
+    }
+
+    // A folder Move names what it kept and what failed, and leaves the folder
+    // markers above them; the rest goes.
+    #[tokio::test]
+    async fn a_folder_move_keeps_what_changed_and_its_folders() {
+        let (client, seen) = server();
+        let v = |e: &str| Some(e.to_string());
+        let sent = vec![
+            ("src/a.bin".to_string(), v("\"v1\"")),
+            ("src/sub/b.bin".to_string(), v("\"v0\"")),
+            ("src/other/broken.bin".to_string(), v("\"v1\"")),
+            ("src/done/c.bin".to_string(), v("\"v1\"")),
+        ];
+        let err = delete_remote_sources(&client, "b", "src", true, &sent, &[]).await.unwrap_err();
+        assert!(err.contains("sub/b.bin") && err.contains("1 object(s) could not be removed"), "{err}");
+        let seen = seen.lock().unwrap().clone();
+        let deleted = |p: &str| seen.iter().any(|r| r.starts_with(&format!("DELETE /b/{p} ")));
+        assert!(deleted("src/done/"), "an emptied folder goes: {seen:?}");
+        assert!(!deleted("src/sub/"), "the folder of a kept object stays");
+        assert!(!deleted("src/"), "the moved folder stays while something is left in it");
+    }
+
+    // A folder marker that holds data was not transferred: it stays, and so do
+    // the folders above it, the moved folder included.
+    #[tokio::test]
+    async fn a_marker_that_holds_data_stays() {
+        let (client, seen) = server();
+        let sent = vec![("src/sub/a.bin".to_string(), Some("\"v1\"".to_string()))];
+        delete_remote_sources(&client, "b", "src", true, &sent, &["src/sub/".to_string()]).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        let deleted = |p: &str| seen.iter().any(|r| r.starts_with(&format!("DELETE /b/{p} ")));
+        assert!(deleted("src/sub/a.bin"));
+        assert!(!deleted("src/sub/"), "the marker with data stays: {seen:?}");
+        assert!(!deleted("src/"), "and the folder above it");
+    }
+
+    #[tokio::test]
+    async fn a_single_move_uses_its_own_version() {
+        let (client, _) = server();
+        let sent = vec![("x/a.bin".to_string(), Some("\"v0\"".to_string()))];
+        let err = delete_remote_sources(&client, "b", "x/a.bin", false, &sent, &[]).await.unwrap_err();
+        assert!(err.contains("kept"), "{err}");
+    }
+
+}
+
+#[cfg(test)]
+mod walk_cancel_tests {
+    use super::walk_files;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn a_canceled_job_stops_walking_the_tree() {
+        let d = std::env::temp_dir().join(format!("bgwalk-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/a.txt"), b"a").unwrap();
+        assert!(walk_files(&d, &AtomicBool::new(true)).unwrap().is_none(), "canceled");
+        assert!(walk_files(&d, &AtomicBool::new(false)).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod local_link_tests {
+    use super::{create_side, remove_local_source, walk_files, write_side};
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bglink-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_folder_walk_leaves_out_links_and_unreadable_names() {
+        let d = scratch("walk");
+        let root = d.join("tree");
+        let outside = d.join("outside.txt");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(&outside, b"secret").unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        symlink(&outside, root.join("link.txt")).unwrap();
+        symlink(&d, root.join("sub/uplink")).unwrap();
+
+        let walk = walk_files(&root, &std::sync::atomic::AtomicBool::new(false)).unwrap().unwrap();
+        let mut rels: Vec<&str> = walk.files.iter().map(|(_, _, r)| r.as_str()).collect();
+        rels.sort();
+        assert_eq!(rels, ["a.txt"]);
+        // A folder holding only a left-out link still arrives, empty.
+        assert_eq!(walk.empty_dirs, ["sub"]);
+        assert_eq!(walk.skipped_links, 2);
+        assert!(walk.skipped_names.is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // macOS (APFS) refuses to create a name that is not valid UTF-8 at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_name_that_is_not_utf8_is_left_out_and_kept_by_a_move() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let d = scratch("utf8");
+        let root = d.join("tree");
+        fs::create_dir_all(root.join(OsStr::from_bytes(b"dir\xfe"))).unwrap();
+        fs::write(root.join(OsStr::from_bytes(b"bad\xff.txt")), b"b").unwrap();
+        let good = root.join("a.txt");
+        fs::write(&good, b"a").unwrap();
+
+        let walk = walk_files(&root, &std::sync::atomic::AtomicBool::new(false)).unwrap().unwrap();
+        let mut rels: Vec<&str> = walk.files.iter().map(|(_, _, r)| r.as_str()).collect();
+        rels.sort();
+        assert_eq!(rels, ["a.txt"]);
+        let mut names = walk.skipped_names.clone();
+        names.sort();
+        assert_eq!(names, ["bad\u{fffd}.txt", "dir\u{fffd}"]);
+
+        remove_local_source(&root, true, &[(good.clone(), None)]).unwrap();
+        assert!(!good.exists(), "a sent file is removed");
+        assert!(root.join(OsStr::from_bytes(b"dir\xfe")).is_dir(), "a left-out folder stays");
+        assert!(root.join(OsStr::from_bytes(b"bad\xff.txt")).exists(), "a left-out file stays");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn moving_a_folder_chosen_through_a_link_removes_only_the_link() {
+        let d = scratch("rootlink");
+        let real = d.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let file = real.join("a.txt");
+        fs::write(&file, b"a").unwrap();
+        let link = d.join("link");
+        symlink(&real, &link).unwrap();
+
+        remove_local_source(&link, true, &[(link.join("a.txt"), None)]).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
+        assert!(file.exists(), "the folder it pointed to keeps its files");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_side_file_is_never_written_through_a_link() {
+        let d = scratch("side");
+        let victim = d.join("victim.txt");
+        fs::write(&victim, b"keep").unwrap();
+        let sidecar = d.join(".x.bgul");
+        let part = d.join(".x.part");
+        symlink(&victim, &sidecar).unwrap();
+        symlink(&victim, &part).unwrap();
+
+        write_side(&sidecar, "{}");
+        drop(create_side(&part).unwrap());
+
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        for p in [&sidecar, &part] {
+            assert!(!fs::symlink_metadata(p).unwrap().file_type().is_symlink(), "{p:?}");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::{Job, TransferManager};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    fn job(conn: &str) -> Job {
+        Job {
+            id: "t1".into(),
+            kind: "upload".into(),
+            src: String::new(),
+            dest_dir: String::new(),
+            name: String::new(),
+            is_dir: false,
+            move_src: false,
+            conflict: "skip".into(),
+            zip_srcs: Vec::new(),
+            conn_id: Some(conn.into()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            sent_local: Mutex::new(Vec::new()),
+            sent_remote: Mutex::new(Vec::new()),
+            keep_remote: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn a_connection_is_busy_while_its_job_waits_or_runs() {
+        let mgr = TransferManager::new();
+        assert!(!mgr.busy_with("A"));
+        mgr.queue.lock().unwrap().push_back(job("A"));
+        assert!(mgr.busy_with("A") && !mgr.busy_with("B"));
+        // A canceled job still in the queue no longer holds its connection.
+        mgr.queue.lock().unwrap()[0]
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!mgr.busy_with("A"));
+        *mgr.current.lock().unwrap() = Some("B".into());
+        assert!(mgr.busy_with("B"));
+    }
+}
+
+#[cfg(test)]
+mod upload_stamp_tests {
+    use super::{UploadResume, remove_local_source, remove_sent_files, source_stamp};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bgstamp-{name}-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn set_mtime(p: &Path, t: SystemTime) {
+        fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+    }
+
+    fn t0() -> SystemTime {
+        UNIX_EPOCH + Duration::new(1_800_000_000, 100)
+    }
+
+    #[test]
+    fn a_rewrite_within_the_same_second_breaks_the_resume() {
+        let d = dir("rewrite");
+        let p = d.join("a.bin");
+        fs::write(&p, b"aaaa").unwrap();
+        set_mtime(&p, t0());
+        let before = source_stamp(&fs::metadata(&p).unwrap());
+        fs::write(&p, b"bbbb").unwrap();
+        set_mtime(&p, t0() + Duration::from_nanos(500));
+        assert_ne!(before, source_stamp(&fs::metadata(&p).unwrap()));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // Windows passes a replaced file's creation time on to its successor for a
+    // few seconds ("tunneling"), so there the identity cannot tell them apart.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_replaced_under_the_same_name_breaks_the_resume() {
+        let d = dir("replace");
+        let (p, q) = (d.join("a.bin"), d.join("b.bin"));
+        fs::write(&p, b"aaaa").unwrap();
+        set_mtime(&p, t0());
+        let before = source_stamp(&fs::metadata(&p).unwrap());
+        // Created later than the first, beyond the file system clock's grain.
+        std::thread::sleep(Duration::from_millis(50));
+        fs::write(&q, b"bbbb").unwrap();
+        set_mtime(&q, t0());
+        fs::rename(&q, &p).unwrap();
+        assert_ne!(before, source_stamp(&fs::metadata(&p).unwrap()));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_untouched_file_keeps_its_resume() {
+        let d = dir("same");
+        let p = d.join("a.bin");
+        fs::write(&p, b"aaaa").unwrap();
+        let first = source_stamp(&fs::metadata(&p).unwrap());
+        assert_eq!(first, source_stamp(&fs::metadata(&p).unwrap()));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // The check before completing reads the open file, so it sees an edit made
+    // meanwhile through the file's name.
+    #[test]
+    fn the_open_file_sees_an_edit_made_meanwhile() {
+        let d = dir("open");
+        let p = d.join("a.bin");
+        fs::write(&p, b"aaaa").unwrap();
+        set_mtime(&p, t0());
+        let file = fs::File::open(&p).unwrap();
+        let before = source_stamp(&file.metadata().unwrap());
+        fs::write(&p, b"bbbb").unwrap();
+        set_mtime(&p, t0() + Duration::from_nanos(500));
+        assert_ne!(before, source_stamp(&file.metadata().unwrap()));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // A Move deletes what was sent, not whatever holds its name by then: a file
+    // saved again meanwhile (a new file renamed over it) stays.
+    #[test]
+    fn a_folder_move_keeps_a_file_replaced_after_it_was_sent() {
+        let d = dir("movekeep");
+        let root = d.join("T");
+        fs::create_dir_all(&root).unwrap();
+        let (a, b) = (root.join("a.bin"), root.join("b.bin"));
+        fs::write(&a, b"old").unwrap();
+        fs::write(&b, b"sent").unwrap();
+        let sa = source_stamp(&fs::metadata(&a).unwrap());
+        let sb = source_stamp(&fs::metadata(&b).unwrap());
+        let tmp = root.join("a.tmp");
+        fs::write(&tmp, b"new!").unwrap();
+        fs::rename(&tmp, &a).unwrap();
+
+        let err = remove_sent_files(&root, &[(a.clone(), Some(sa)), (b.clone(), Some(sb))]);
+        assert!(a.exists(), "the file saved again stays");
+        assert!(!b.exists(), "an unchanged sent file goes");
+        assert!(err.is_err_and(|e| e.contains("changed")), "the user hears why a.bin stayed");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_single_file_move_keeps_a_file_replaced_after_it_was_sent() {
+        let d = dir("movekeep1");
+        let a = d.join("a.bin");
+        fs::write(&a, b"old").unwrap();
+        let sa = source_stamp(&fs::metadata(&a).unwrap());
+        let tmp = d.join("a.tmp");
+        fs::write(&tmp, b"new!").unwrap();
+        fs::rename(&tmp, &a).unwrap();
+
+        assert!(remove_local_source(&a, false, &[(a.clone(), Some(sa))]).is_err());
+        assert!(a.exists(), "the file saved again stays");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_record_written_now_is_read_back() {
+        let d = dir("roundtrip");
+        let p = d.join("a.bin");
+        fs::write(&p, b"aaaa").unwrap();
+        let source = source_stamp(&fs::metadata(&p).unwrap());
+        let rec = UploadResume { key: "k".into(), upload_id: "u".into(), part_size: 8, source: source.clone() };
+        let back: UploadResume = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert!(back.key == "k" && back.upload_id == "u" && back.part_size == 8);
+        assert_eq!(back.source, source);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // A file with no record of being sent is left alone: a rename took the one
+    // that was, and this one arrived afterwards.
+    #[test]
+    fn a_move_leaves_a_file_it_did_not_send() {
+        let d = dir("norecord");
+        let a = d.join("a.bin");
+        fs::write(&a, b"arrived later").unwrap();
+        remove_local_source(&a, false, &[]).unwrap();
+        assert!(a.exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_resume_record_from_an_earlier_version_is_not_trusted() {
+        let old = r#"{"key":"k","upload_id":"u","part_size":8388608,"size":4,"mtime":1800000000}"#;
+        assert!(serde_json::from_str::<UploadResume>(old).is_err());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod network_mark_tests {
+    use super::mark_from_network;
+    use std::ffi::CString;
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn quarantine_of(p: &Path) -> Option<String> {
+        let c = CString::new(p.as_os_str().as_bytes()).unwrap();
+        let mut buf = [0u8; 256];
+        // SAFETY: both names are NUL-terminated and the buffer outlives the call.
+        let n = unsafe {
+            libc::getxattr(
+                c.as_ptr(),
+                c"com.apple.quarantine".as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                0,
+            )
+        };
+        (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bgmark-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_downloaded_file_carries_the_quarantine_mark() {
+        let d = scratch("apfs");
+        let f = d.join("x.txt");
+        fs::write(&f, b"x").unwrap();
+        mark_from_network(&f);
+        let mark = quarantine_of(&f);
+        let _ = fs::remove_dir_all(&d);
+        let mark = mark.expect("the file has no quarantine mark");
+        assert!(mark.starts_with("0081;") && mark.ends_with(";BG Bucket Browser;"), "{mark}");
+    }
+
+    /// Marks a file on a fresh disk image of the given format; returns the mark
+    /// and whether a `._` side file appeared.
+    fn mark_on_image(fs_name: &str, tag: &str) -> (Option<String>, bool) {
+        let d = scratch(tag);
+        let image = d.join("disk.dmg");
+        let made = Command::new("hdiutil")
+            .args(["create", "-quiet", "-size", "5m", "-fs", fs_name, "-volname", "BGMARK", "-o"])
+            .arg(&image)
+            .status()
+            .unwrap();
+        assert!(made.success(), "hdiutil create failed for {fs_name}");
+        let mount = d.join("mnt");
+        fs::create_dir_all(&mount).unwrap();
+        let attached = Command::new("hdiutil")
+            .args(["attach", "-quiet", "-nobrowse", "-mountpoint"])
+            .arg(&mount)
+            .arg(&image)
+            .status()
+            .unwrap();
+        assert!(attached.success(), "hdiutil attach failed for {fs_name}");
+        let f = mount.join("x.txt");
+        fs::write(&f, b"x").unwrap();
+        mark_from_network(&f);
+        let mark = quarantine_of(&f);
+        let side = mount.join("._x.txt").exists();
+        let _ = Command::new("hdiutil").args(["detach", "-quiet"]).arg(&mount).status();
+        let _ = fs::remove_dir_all(&d);
+        (mark, side)
+    }
+
+    #[test]
+    fn a_fat_volume_gets_no_mark_and_no_side_file() {
+        assert_eq!(mark_on_image("MS-DOS", "fat"), (None, false));
+    }
+
+    #[test]
+    fn an_exfat_volume_gets_no_mark_and_no_side_file() {
+        assert_eq!(mark_on_image("ExFAT", "exfat"), (None, false));
+    }
+}
+
+#[cfg(test)]
+mod stale_resume_tests {
+    use super::{SourceStamp, UploadResume, drop_earlier_attempt, usable_resume};
+    use aws_sdk_s3::Client;
+    use aws_sdk_s3::primitives::SdkBody;
+    use aws_smithy_http_client::test_util::infallible_client_fn;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    /// A client whose server answers every request with an empty success and
+    /// records it as "METHOD path?query".
+    fn recorder() -> (Client, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let http = infallible_client_fn(move |req: http::Request<SdkBody>| {
+            let target = req.uri().path_and_query().map_or("", |p| p.as_str()).to_string();
+            log.lock().unwrap().push(format!("{} {target}", req.method()));
+            http::Response::builder().status(204).body(SdkBody::empty()).unwrap()
+        });
+        let (client, _) = crate::core::s3_client_from_parts(
+            "https://gateway.test", "eu-ro-1", "b", "AKIDTEST", "not-a-secret",
+        );
+        let conf = client.config().to_builder().http_client(http).build();
+        (Client::from_conf(conf), seen)
+    }
+
+    fn stamp(mtime_ns: u64) -> SourceStamp {
+        SourceStamp { size: 4, mtime_ns, id: "7".into() }
+    }
+
+    /// A sidecar holding `text`, in a folder of its own; the folder is returned
+    /// for the test to remove.
+    fn sidecar(tag: &str, text: &str) -> (PathBuf, PathBuf) {
+        let d = std::env::temp_dir().join(format!("bgresume-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let p = d.join(".a.bin.bgul");
+        fs::write(&p, text).unwrap();
+        (d, p)
+    }
+
+    fn record(key: &str, upload_id: &str, source: SourceStamp) -> String {
+        let rec = UploadResume { key: key.into(), upload_id: upload_id.into(), part_size: 8, source };
+        serde_json::to_string(&rec).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_record_for_the_same_file_is_kept() {
+        let (d, p) = sidecar("same", &record("k", "u1", stamp(1)));
+        let (client, seen) = recorder();
+        let got = usable_resume(&client, "b", "k", &stamp(1), &p).await;
+        let kept = p.exists();
+        let _ = fs::remove_dir_all(&d);
+        assert!(got.is_some_and(|r| r.upload_id == "u1"));
+        assert!(seen.lock().unwrap().is_empty(), "nothing is aborted");
+        assert!(kept);
+    }
+
+    #[tokio::test]
+    async fn a_record_for_a_changed_file_aborts_its_upload() {
+        let (d, p) = sidecar("changed", &record("k", "u1", stamp(1)));
+        let (client, seen) = recorder();
+        let got = usable_resume(&client, "b", "k", &stamp(2), &p).await;
+        let kept = p.exists();
+        let _ = fs::remove_dir_all(&d);
+        assert!(got.is_none());
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() == 1 && seen[0].starts_with("DELETE ") && seen[0].contains("uploadId=u1"), "{seen:?}");
+        assert!(!kept, "the record goes with its upload");
+    }
+
+    // Another key's upload may be running in another window of the app.
+    #[tokio::test]
+    async fn a_record_for_another_key_is_left_alone() {
+        let (d, p) = sidecar("key", &record("k", "u1", stamp(1)));
+        let (client, seen) = recorder();
+        let got = usable_resume(&client, "b", "other", &stamp(1), &p).await;
+        let kept = p.exists();
+        let _ = fs::remove_dir_all(&d);
+        assert!(got.is_none());
+        assert!(seen.lock().unwrap().is_empty(), "nothing is aborted");
+        assert!(kept);
+    }
+
+    #[tokio::test]
+    async fn a_record_from_an_earlier_version_aborts_its_upload() {
+        let old = r#"{"key":"k","upload_id":"u0","part_size":8388608,"size":4,"mtime":1800000000}"#;
+        let (d, p) = sidecar("old", old);
+        let (client, seen) = recorder();
+        let got = usable_resume(&client, "b", "k", &stamp(1), &p).await;
+        let _ = fs::remove_dir_all(&d);
+        assert!(got.is_none());
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() == 1 && seen[0].starts_with("DELETE ") && seen[0].contains("uploadId=u0"), "{seen:?}");
+    }
+
+    // A file that shrank below one part goes up in a single request; the
+    // multipart attempt it made while larger is dropped all the same.
+    #[tokio::test]
+    async fn a_whole_upload_drops_the_earlier_attempt_for_its_key() {
+        let (d, p) = sidecar("small", &record("k", "u2", stamp(1)));
+        let (client, seen) = recorder();
+        drop_earlier_attempt(&client, "b", "k", &p).await;
+        let kept = p.exists();
+        let _ = fs::remove_dir_all(&d);
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() == 1 && seen[0].contains("uploadId=u2"), "{seen:?}");
+        assert!(!kept);
     }
 }

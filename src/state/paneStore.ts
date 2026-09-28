@@ -165,10 +165,20 @@ function patchTab(
     is dropped: the user has moved on, in that tab or to another. */
 const latestRequest = new Map<string, number>();
 let requestCounter = 0;
-function beginRequest(tabId: string): () => boolean {
+/** Names this page load in the lanes: a reload starts the counter again at
+    zero, while the Rust side still holds the old load's numbers. */
+const LOAD_ID = crypto.randomUUID();
+function beginRequest(tabId: string): {
+  isLatest: () => boolean;
+  /** Passed to a remote listing, which stops when a newer request starts on the tab. */
+  lane: { tab: string; seq: number };
+} {
   const n = ++requestCounter;
   latestRequest.set(tabId, n);
-  return () => latestRequest.get(tabId) === n;
+  return {
+    isLatest: () => latestRequest.get(tabId) === n,
+    lane: { tab: `${LOAD_ID}:${tabId}`, seq: n },
+  };
 }
 
 /** Keeps only the selected entries that are on screen. What is selected is
@@ -359,7 +369,7 @@ persist((set, get) => ({
     // twice.
     const side = get().panes[index].side;
     const id = tabId ?? get().panes[index].activeTabId;
-    const isLatest = beginRequest(id);
+    const { isLatest, lane } = beginRequest(id);
     set({
       panes: patchTab(get().panes, index, id, (tb) => ({
         ...tb,
@@ -372,7 +382,7 @@ persist((set, get) => ({
 
     try {
       const listing =
-        side === "remote" ? await listRemote(path) : await listLocal(path);
+        side === "remote" ? await listRemote(path, undefined, lane) : await listLocal(path);
       if (!isLatest()) return;
       // Only a folder that actually opened is worth remembering.
       useRecentStore.getState().visit(side, path);
@@ -422,7 +432,7 @@ persist((set, get) => ({
     const pane = get().panes[index];
     const tab = pane.tabs.find((tb) => tb.id === (tabId ?? pane.activeTabId));
     if (!tab || tab.status === "loading") return; // a fetch is already out
-    const isLatest = beginRequest(tab.id);
+    const { isLatest, lane } = beginRequest(tab.id);
     const side = pane.side;
     const showHidden = useUiStore.getState().showHidden;
 
@@ -440,7 +450,7 @@ persist((set, get) => ({
     try {
       const listing =
         side === "remote"
-          ? await listRemote(tab.path)
+          ? await listRemote(tab.path, undefined, lane)
           : await listLocal(tab.path);
       if (!isLatest()) return;
       const names = sortEntries(

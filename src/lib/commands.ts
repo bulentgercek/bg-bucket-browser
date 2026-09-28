@@ -71,14 +71,14 @@ async function invoke<T = void>(cmd: string, args?: InvokeArgs): Promise<T> {
 }
 
 export interface TestConnectionArgs {
-  /** Whose stored keys to fall back on when the key fields are left blank; the
-      live connection when this is not given, and nothing for a connection that
-      has not been saved yet. */
+  /** Whose stored keys to fall back on when the key fields are left blank.
+      Given only for a saved connection; its keys are used only while the form
+      still points at the endpoint they were saved for. */
   id?: string;
   endpoint: string;
   region: string;
   bucket: string;
-  /** Left out to test with the stored keys. */
+  /** Left out to test a saved connection with its stored keys. */
   accessKey?: string;
   secretKey?: string;
 }
@@ -103,6 +103,10 @@ export type TestErrKind =
   | "badResponse"
   | "badRequest"
   | "noCredentials"
+  /** Plain `http` to another machine: credentials only travel over `https`. */
+  | "insecureEndpoint"
+  /** Not an `https://` or `http://` address. */
+  | "badEndpoint"
   | "unknown";
 
 /** A failed connection test, as the rejection value. */
@@ -134,6 +138,8 @@ export type FsErrKind =
   | "unsupported"
   | "io"
   | "s3"
+  /** The window that asked for it closed first. */
+  | "canceled"
   | "unknown";
 
 export interface FsErr {
@@ -192,12 +198,19 @@ export interface FolderSize {
 }
 
 /** The recursive size of a folder. Slow on a large remote folder: it is one
-    request per page of objects. */
+    request per page of objects. A scan given an id can be called off with
+    `cancelFolderSize`; it then rejects with `canceled`. */
 export function folderSize(
   remote: boolean,
   path: string,
+  scan?: string,
 ): Promise<FolderSize> {
-  return invoke<FolderSize>("folder_size", { remote, path });
+  return invoke<FolderSize>("folder_size", { remote, path, scan });
+}
+
+/** Stops a folder-size scan that is still running. */
+export function cancelFolderSize(scan: string): Promise<void> {
+  return invoke("cancel_folder_size", { scan });
 }
 
 /* ── The transfer queue ─────────────────────── */
@@ -226,6 +239,8 @@ export function transferStart(
       backend picks the free name itself when renaming; the name passed here is
       only a first guess. */
   conflict: ConflictPolicy = "skip",
+  /** The connection the user started the job on; the active one when missing. */
+  connId?: string,
 ): Promise<string> {
   return invoke<string>("transfer_start", {
     kind,
@@ -235,6 +250,7 @@ export function transferStart(
     isDir,
     moveSrc,
     conflict,
+    connId,
   });
 }
 
@@ -244,8 +260,8 @@ export function transferStart(
  * nothing on the volume. There is no size limit; a large file can be cancelled
  * from the queue like any other transfer.
  */
-export function openRemoteStart(path: string, name: string): Promise<string> {
-  return invoke<string>("open_remote_start", { path, name });
+export function openRemoteStart(path: string, name: string, connId?: string): Promise<string> {
+  return invoke<string>("open_remote_start", { path, name, connId });
 }
 
 /** Streams the selected remote items into one archive on the local disk. */
@@ -253,8 +269,9 @@ export function transferZipStart(
   srcs: { path: string; isDir: boolean }[],
   destDir: string,
   name: string,
+  connId?: string,
 ): Promise<string> {
-  return invoke<string>("transfer_zip_start", { srcs, destDir, name });
+  return invoke<string>("transfer_zip_start", { srcs, destDir, name, connId });
 }
 
 /** Cancels one transfer; a partial download stays on disk to resume from. */
@@ -269,8 +286,8 @@ export function transferCancelAll(): Promise<void> {
 
 /* ── Unfinished uploads ─────────────────────────────
    A multipart upload that was never completed or aborted keeps its parts on the
-   volume. Old ones are swept at startup; this is the manual cleanup in
-   Settings. */
+   volume. Nothing aborts them automatically; Settings lists them and aborts
+   the ones the user confirms. */
 
 export interface OrphanUpload {
   key: string;
@@ -492,6 +509,12 @@ export type ListErrKind =
   | "unreachable"
   | "credentials"
   | "io"
+  /** The endpoint may not carry credentials: plain http to another machine. */
+  | "endpoint"
+  /** A newer listing started on the same tab; the tab has moved on and never shows it. */
+  | "canceled"
+  /** The folder holds more entries than a listing may: over a million. */
+  | "tooLarge"
   | "unknown";
 
 /** A failed listing, as the rejection value. */
@@ -505,9 +528,16 @@ export interface ListErr {
 /**
  * Lists a remote directory, given a path relative to the volume root. Entries
  * arrive sorted, directories first. Rejects with a `ListErr`.
+ *
+ * `lane` names the tab asking and its request number: a listing stops, with
+ * `canceled`, as soon as a newer one starts on the same tab.
  */
-export function listRemote(path: string): Promise<DirEntry[]> {
-  return invoke<DirEntry[]>("list_remote", { path });
+export function listRemote(
+  path: string,
+  connId?: string,
+  lane?: { tab: string; seq: number },
+): Promise<DirEntry[]> {
+  return invoke<DirEntry[]>("list_remote", { path, connId, lane });
 }
 
 /**
@@ -573,6 +603,8 @@ export function openUrl(url: string): Promise<void> {
 export interface ScanEntry {
   key: string;
   size: number;
+  /** The version the scan saw; a deletion is bound to it. */
+  etag: string;
 }
 
 export interface FolderStat {
@@ -587,9 +619,14 @@ export interface ScanReport {
   totalBytes: number;
   topFolders: FolderStat[];
   largest: ScanEntry[];
+  /** The largest reclaimable objects; at most 1000 of them. */
   reclaimable: ScanEntry[];
-  /** Folders the scan did not enter (`.git`, `node_modules`, `site-packages`); not in the totals. */
+  /** Every reclaimable object, listed or not. */
+  reclaimableCount: number;
+  reclaimableBytes: number;
+  /** Folders the scan did not enter (`.git`, `node_modules`, `site-packages`), at most 1000; not in the totals. */
   skipped: string[];
+  skippedCount: number;
 }
 
 /** How far the scan has got, sent periodically while it runs. */
@@ -606,9 +643,17 @@ export function cancelScan(): Promise<void> {
   return invoke("cancel_scan");
 }
 
-/** Deletes the given objects and returns how many really went. */
-export function deleteScanned(keys: string[]): Promise<number> {
-  return invoke<number>("delete_scanned", { keys });
+/** What a Cleanup deletion did: objects deleted, objects that changed since
+    the scan and were kept, and objects that could not be deleted. */
+export interface DeleteReport {
+  deleted: number;
+  changed: number;
+  failed: number;
+}
+
+/** Deletes the picked objects, each only in the version the scan saw. */
+export function deleteScanned(picks: { key: string; etag: string }[]): Promise<DeleteReport> {
+  return invoke<DeleteReport>("delete_scanned", { picks });
 }
 
 /** What the OS clipboard holds, when it holds files. An empty list is not a
@@ -617,6 +662,9 @@ export function deleteScanned(keys: string[]): Promise<number> {
 export interface OsClipboardState {
   paths: string[];
   cut: boolean;
+  /** `false` when the clipboard could not be read in time: what it holds is
+      unknown, not empty. */
+  known: boolean;
 }
 export function readOsClipboardFiles(): Promise<OsClipboardState> {
   return invoke<OsClipboardState>("read_os_clipboard_files");

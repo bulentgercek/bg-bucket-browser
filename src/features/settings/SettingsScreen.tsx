@@ -35,8 +35,10 @@ import { useConnectionStore } from "../../state/connectionStore";
 import { usePinStore } from "../../state/pinStore";
 import { useDialogStore } from "../../state/dialogStore";
 import { useToastStore } from "../../state/toastStore";
+import { isPreparingOn } from "../../state/transferQueueStore";
 import { formatSize } from "../../lib/format";
 import { IS_WINDOWS, IS_MACOS } from "../../lib/platform";
+import { FONT_SIZES } from "../../lib/zoom";
 import { t } from "../../locale/en";
 import FeedbackSection from "./FeedbackSection";
 
@@ -125,7 +127,7 @@ function TestResult({ state }: { state: TestState }) {
           <div className="space-y-0.5">
             <div className="text-neutral-200">{t(`testError.${kind}`)}</div>
             {tech && <div className="text-neutral-500">{tech}</div>}
-            <div className="leading-snug text-neutral-400">{detail}</div>
+            {detail && <div className="leading-snug text-neutral-400">{detail}</div>}
           </div>
         </div>
       );
@@ -369,6 +371,12 @@ function ConnectionBlock({
     secretKey.length > 0;
 
   async function save() {
+    // A transfer still being prepared on this connection is not in the Rust
+    // queue yet; it would follow the change like a queued one.
+    if (conn && (endpoint !== conn.endpoint || bucket !== conn.bucket) && isPreparingOn(id)) {
+      useToastStore.getState().push(t("settings.connections.busy"), "error");
+      return;
+    }
     setSaving(true);
     try {
       await saveConnection({
@@ -383,6 +391,19 @@ function ConnectionBlock({
       setAccessKey("");
       setSecretKey("");
       onChanged(id);
+    } catch (err) {
+      // Refusals Rust names with a code: transfers of this connection would
+      // follow the change, or the endpoint may not carry credentials.
+      if (
+        err === "busy" ||
+        err === "insecureEndpoint" ||
+        err === "badEndpoint" ||
+        err === "keysRequired"
+      ) {
+        useToastStore.getState().push(t(`settings.connections.${err}`), "error");
+      } else {
+        throw err;
+      }
     } finally {
       setSaving(false);
     }
@@ -423,11 +444,18 @@ function ConnectionBlock({
       danger: true,
       onConfirm: () => {
         useDialogStore.getState().close();
-        void deleteConnection(id).then(() => {
-          // A remote pin belongs to its connection and goes with it.
-          usePinStore.getState().removePinsForConn(id);
-          onChanged(id);
-        });
+        void deleteConnection(id)
+          .then(() => {
+            // A remote pin belongs to its connection and goes with it.
+            usePinStore.getState().removePinsForConn(id);
+            onChanged(id);
+          })
+          // The keys could not be removed from the keychain; the connection stays,
+          // and its block is read again in case one of its keys is already gone.
+          .catch((e: unknown) => {
+            useToastStore.getState().push(String(e), "error");
+            onChanged(id);
+          });
       },
     });
   }
@@ -597,10 +625,20 @@ function RunpodKeyBlock() {
     setSaving(true);
     setRunpodApiKey(key)
       .then(() => {
-        useToastStore
-          .getState()
-          .push(t(key.trim() ? "settings.runpod.saved" : "settings.runpod.cleared"));
+        useToastStore.getState().push(t("settings.runpod.saved"));
         setKey("");
+        refresh();
+      })
+      .catch((e: unknown) => useToastStore.getState().push(String(e), "error"))
+      .finally(() => setSaving(false));
+  };
+
+  // Removing the key is an action of its own: an empty field means "keep it".
+  const remove = () => {
+    setSaving(true);
+    setRunpodApiKey("")
+      .then(() => {
+        useToastStore.getState().push(t("settings.runpod.cleared"));
         refresh();
       })
       .catch((e: unknown) => useToastStore.getState().push(String(e), "error"))
@@ -636,6 +674,16 @@ function RunpodKeyBlock() {
         >
           {t("settings.runpod.save")}
         </button>
+        {stored && (
+          <button
+            type="button"
+            className={"btn btn-ghost " + (saving ? "pointer-events-none opacity-40" : "")}
+            disabled={saving}
+            onClick={remove}
+          >
+            {t("settings.runpod.remove")}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -647,6 +695,8 @@ export default function SettingsScreen() {
   const setNav = useUiStore((s) => s.setSettingsTab);
   const theme = useUiStore((s) => s.theme);
   const setTheme = useUiStore((s) => s.setTheme);
+  const fontSize = useUiStore((s) => s.fontSize);
+  const setFontSize = useUiStore((s) => s.setFontSize);
   const osDropMode = useUiStore((s) => s.osDropMode);
   const setOsDropMode = useUiStore((s) => s.setOsDropMode);
 
@@ -697,9 +747,25 @@ export default function SettingsScreen() {
 
   const onBlockChanged = (changedId: string) => {
     setDrafts((d) => d.filter((x) => x !== changedId));
+    // The live volume before the change: which connection, and where it points.
+    const liveVolume = () => {
+      const s = useConnectionStore.getState();
+      const c = s.connections.find((x) => x.id === s.activeId) ?? s.connections[0];
+      return c ? [c.id, c.endpoint, c.bucket].join("\n") : "";
+    };
+    const before = liveVolume();
     void reloadConns().then(() => {
-      // The live connection may now point somewhere else.
-      void usePaneStore.getState().refresh(0);
+      // When the live connection now points somewhere else, the remote tab
+      // loads anew: its rows belong to the old volume and must neither stay on
+      // screen nor answer shortcuts while the new list is fetched.
+      const panes = usePaneStore.getState();
+      if (liveVolume() !== before) {
+        const pane = panes.panes[0];
+        const tab = pane.tabs.find((tb) => tb.id === pane.activeTabId) ?? pane.tabs[0];
+        void panes.navigate(0, tab.path);
+      } else {
+        void panes.refresh(0);
+      }
     });
   };
 
@@ -729,8 +795,10 @@ export default function SettingsScreen() {
         </button>
       </div>
 
-      {/* ── Body: 196px nav + content ── */}
-      <div className="grid min-h-[420px] flex-1 grid-cols-[196px_1fr] overflow-hidden">
+      {/* ── Body: 196px nav + content ──
+         It takes the height the window leaves and never asks for more: in a
+         short window the content column scrolls and the title bar stays put. */}
+      <div className="grid min-h-0 flex-1 grid-cols-[196px_1fr] overflow-hidden">
         <nav className="flex flex-col gap-0.5 bg-chrome px-2.5 py-4">
           <NavItem
             icon={HardDrivesIcon}
@@ -787,6 +855,36 @@ export default function SettingsScreen() {
                         onChange={() => setTheme(val)}
                       />
                       {t(`settings.theme.${val}`)}
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="h-px bg-neutral-900" />
+
+              <div className="flex items-center justify-between gap-6">
+                <div>
+                  <div className="text-[13px]">
+                    {t("settings.fontSize.label")}
+                  </div>
+                  <div className="max-w-[360px] text-[11.5px] text-neutral-500">
+                    {t(
+                      IS_MACOS
+                        ? "settings.fontSize.subline.mac"
+                        : "settings.fontSize.subline",
+                    )}
+                  </div>
+                </div>
+                <div className="seg shrink-0">
+                  {FONT_SIZES.map((val) => (
+                    <label key={val} className="seg-opt">
+                      <input
+                        type="radio"
+                        name="fontSize"
+                        checked={fontSize === val}
+                        onChange={() => setFontSize(val)}
+                      />
+                      {t(`settings.fontSize.${val}`)}
                     </label>
                   ))}
                 </div>

@@ -19,6 +19,7 @@ pub mod os_drag;
 pub mod runpod;
 pub mod thumbs;
 pub mod transfers;
+pub mod zip_writer;
 pub use core::*;
 
 /// Builds the Tauri application and runs it until the window closes.
@@ -79,6 +80,7 @@ pub fn run() {
             fs_ops::rename,
             fs_ops::delete,
             fs_ops::folder_size,
+            fs_ops::cancel_folder_size,
             listing::list_remote,
             listing::list_local,
             listing::stat_paths,
@@ -104,11 +106,10 @@ pub fn run() {
         .manage(desktop_integration::OpenHereState::default())
         .setup(|app| {
             devlog::init(app.handle());
-            // Aborts unfinished multipart uploads older than 7 days, in the background.
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(transfers::sweep_old_orphans(handle));
             // Empties the cache of remote files downloaded only to be opened.
             transfers::clear_opened_cache(app.handle());
+            // An "Open in" entry written by an older version is brought up to date.
+            desktop_integration::refresh_open_here();
             Ok(())
         })
         .on_window_event(|window, event| match event {

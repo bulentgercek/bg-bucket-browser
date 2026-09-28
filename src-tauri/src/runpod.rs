@@ -10,6 +10,8 @@ use tauri::AppHandle;
 use crate::config::{active_client, runpod_api_key};
 
 const GRAPHQL_URL: &str = "https://api.runpod.io/graphql";
+/// The largest account answer read; a real one is a few hundred bytes.
+const MAX_ANSWER_BYTES: usize = 1024 * 1024;
 
 #[derive(Serialize)]
 struct GqlBody {
@@ -71,16 +73,22 @@ pub async fn volume_quota(app: AppHandle) -> Result<VolumeQuota, String> {
         .build()
         .map_err(|e| e.to_string())?;
     // The key goes in a header: URLs end up in server logs and in error messages.
-    let resp = client
+    let mut answer = client
         .post(GRAPHQL_URL)
         .bearer_auth(api_key)
         .json(&body)
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .json::<GqlResponse>()
-        .await
         .map_err(|e| e.to_string())?;
+    // The answer is a short list of volumes; anything far larger is refused.
+    let mut bytes = Vec::new();
+    while let Some(chunk) = answer.chunk().await.map_err(|e| e.to_string())? {
+        if bytes.len() + chunk.len() > MAX_ANSWER_BYTES {
+            return Err("the RunPod answer is too large".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let resp: GqlResponse = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
 
     // GraphQL reports failures in the body with HTTP 200, so check `errors` first.
     if let Some(errs) = resp.errors {

@@ -168,6 +168,8 @@ export interface RunTransferArgs {
   mode: "copy" | "move";
   /** Source label for the queue row; derived from `srcSide` when missing, `"OS"` for OS drops. */
   fromLabel?: string;
+  /** The connection, when the caller took it before waiting for something. */
+  conn?: { connId: string; connName: string };
 }
 
 /** Pane side as it appears in the queue. */
@@ -176,11 +178,21 @@ export function sideLabel(side: PaneSide): string {
 }
 
 /** Id and name of the active connection, or nothing when the user has none. */
-function activeConn(): { connId: string; connName: string } | undefined {
+export function activeConn(): { connId: string; connName: string } | undefined {
   const { activeId, connections } = useConnectionStore.getState();
   if (!activeId) return undefined;
   const c = connections.find((x) => x.id === activeId);
   return { connId: activeId, connName: c?.name || c?.bucket || activeId };
+}
+
+/* Connections a transfer is being prepared on. Until `transferStart` is sent
+   the job is not in the Rust queue, so Rust cannot tell Settings it is busy;
+   Settings asks here as well. */
+const preparing = new Map<string, number>();
+
+/** True while a transfer on connection `connId` is being prepared. */
+export function isPreparingOn(connId: string): boolean {
+  return (preparing.get(connId) ?? 0) > 0;
 }
 
 function pickKind(
@@ -272,19 +284,54 @@ export async function runTransfer(args: RunTransferArgs): Promise<void> {
 
   const kind = pickKind(srcSide, destSide, move);
 
+  // The connection is taken now, before anything waits: a remote listing takes
+  // seconds and the user may switch connections meanwhile. The conflict check,
+  // the job and its queue row all use this one.
+  const conn =
+    srcSide === "remote" || destSide === "remote"
+      ? "conn" in args
+        ? args.conn
+        : activeConn()
+      : undefined;
+  const liveBucket = useConnectionStore.getState().bucket;
+  if (conn) preparing.set(conn.connId, (preparing.get(conn.connId) ?? 0) + 1);
+  try {
+    await prepareAndStart(args, kind, move, sameDir, from, to, conn, liveBucket);
+  } finally {
+    if (conn) preparing.set(conn.connId, (preparing.get(conn.connId) ?? 1) - 1);
+  }
+}
+
+/** The part of `runTransfer` that waits: the destination listing and the
+ *  conflict dialog, then the jobs themselves. */
+async function prepareAndStart(
+  args: RunTransferArgs,
+  kind: TransferKind,
+  move: boolean,
+  sameDir: boolean,
+  from: string,
+  to: string,
+  conn: { connId: string; connName: string } | undefined,
+  liveBucket: string,
+): Promise<void> {
+  const { items, srcPath, destSide, destPath } = args;
+
   // Names already in the destination, from a fresh listing plus what the pane currently shows.
   const taken = new Set<string>();
   try {
     const dest =
       destSide === "remote"
-        ? await listRemote(destPath)
+        ? await listRemote(destPath, conn?.connId)
         : await listLocal(destPath);
     for (const e of dest) taken.add(e.name);
   } catch {
     /* destination could not be listed; the conflict check falls back to the pane */
   }
+  // A remote pane shows the active connection, which may no longer be the job's.
+  const switched =
+    destSide === "remote" && useConnectionStore.getState().activeId !== conn?.connId;
   for (const pane of usePaneStore.getState().panes) {
-    if (pane.side !== destSide) continue;
+    if (pane.side !== destSide || switched) continue;
     const tb =
       pane.tabs.find((x) => x.id === pane.activeTabId) ?? pane.tabs[0];
     if (tb.path === destPath) for (const e of tb.listing) taken.add(e.name);
@@ -312,8 +359,7 @@ export async function runTransfer(args: RunTransferArgs): Promise<void> {
     } else {
       const paneIndex: 0 | 1 = destSide === "remote" ? 0 : 1;
       const label =
-        lastSegment(destPath) ||
-        (destSide === "remote" ? useConnectionStore.getState().bucket : "~");
+        lastSegment(destPath) || (destSide === "remote" ? liveBucket : "~");
       const resolved = await resolveConflicts(collisions, label, paneIndex);
       if (!resolved) return; // user canceled
       const acc = new Set(taken);
@@ -337,9 +383,6 @@ export async function runTransfer(args: RunTransferArgs): Promise<void> {
   }
 
   if (plan.length === 0) return;
-  // Jobs that touch the remote carry the connection they were started with.
-  const conn =
-    srcSide === "remote" || destSide === "remote" ? activeConn() : undefined;
   for (const { item, destName, conflict } of plan) {
     void transferStart(
       kind,
@@ -349,6 +392,7 @@ export async function runTransfer(args: RunTransferArgs): Promise<void> {
       item.kind === "dir",
       move,
       conflict,
+      conn?.connId,
     ).then((id) =>
       addStarted({ id, kind, name: destName, from, to, move, ...conn }),
     );
@@ -420,6 +464,7 @@ export async function pasteIntoPane(
 
   const tag = useClipboardStore.getState().osClipboardTag;
   if (!tag) return;
+  const conn = activeConn(); // before anything waits (N7)
   try {
     const groups = await groupPathsByDir(tag.paths);
     if (groups.size === 0) {
@@ -436,6 +481,7 @@ export async function pasteIntoPane(
         destPath: dest,
         mode: tag.mode,
         fromLabel: t("route.os"),
+        conn,
       });
     }
     if (tag.mode === "move") useClipboardStore.getState().clearOsClipboardTag();
@@ -480,7 +526,7 @@ export function startPaneZip(sourceIndex: 0 | 1): void {
       : lastSegment(srcTab.path) || "archive";
 
   const conn = activeConn(); // the guard above makes this a remote source
-  void transferZipStart(srcs, otherTab.path, base).then((id) =>
+  void transferZipStart(srcs, otherTab.path, base, conn?.connId).then((id) =>
     addStarted({
       id,
       kind: "downloadZip",
@@ -497,7 +543,7 @@ export function startPaneZip(sourceIndex: 0 | 1): void {
 export function startOpenRemote(entry: Entry, srcPath: string): void {
   if (entry.kind === "dir") return; // a remote folder has nothing to open
   const conn = activeConn();
-  void openRemoteStart(childPath(srcPath, entry.name), entry.name).then((id) =>
+  void openRemoteStart(childPath(srcPath, entry.name), entry.name, conn?.connId).then((id) =>
     addStarted({
       id,
       kind: "openDownload",
@@ -604,17 +650,29 @@ export async function initTransferEvents(): Promise<void> {
     s.finish(e.payload.id, "done");
     if (tr) refreshAfter(tr);
   });
-  await listen<{ id: string; detail: string }>("transfer-error", (e) => {
+  await listen<{ id: string; name?: string; detail: string }>("transfer-error", (e) => {
     const tr = useTransferStore
       .getState()
       .transfers.find((x) => x.id === e.payload.id);
     s.finish(e.payload.id, "error", e.payload.detail);
     // The error also becomes a toast, because the queue pill disappears with the last live job.
+    // The job's name comes with the error: a job refused at once can end before its row exists.
+    const name = tr?.name ?? e.payload.name;
     useToastStore
       .getState()
-      .push(tr ? `${tr.name}: ${e.payload.detail}` : e.payload.detail, "error");
+      .push(name ? `${name}: ${e.payload.detail}` : e.payload.detail, "error");
   });
   await listen<{ id: string }>("transfer-canceled", (e) => {
     s.finish(e.payload.id, "canceled");
+  });
+  // What a folder job left out on purpose (symbolic links, names that are not
+  // valid UTF-8) is reported once, as the job ends.
+  // The job's name comes with the note: a very short job can end before its row exists.
+  await listen<{ id: string; name: string; detail: string }>("transfer-note", (e) => {
+    const tr = useTransferStore
+      .getState()
+      .transfers.find((x) => x.id === e.payload.id);
+    const name = tr?.name ?? e.payload.name;
+    useToastStore.getState().push(`${name}: ${e.payload.detail}`, "info");
   });
 }

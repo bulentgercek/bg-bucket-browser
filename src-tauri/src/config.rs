@@ -91,9 +91,19 @@ pub(crate) fn kr_set(account: &str, value: &str) -> Result<(), BoxErr> {
         .map_err(Into::into)
 }
 
-pub(crate) fn kr_del(account: &str) {
-    if let Ok(e) = keyring::Entry::new(KEYRING_SERVICE, account) {
-        let _ = e.delete_credential();
+/// Deletes one keychain entry; an entry that is already gone is not an error.
+/// The entry is read back afterwards, because a backend may report a delete it
+/// did not do.
+pub(crate) fn kr_del(account: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    match entry.get_password() {
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Ok(_) => Err("the key is still in the keychain".into()),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -107,7 +117,7 @@ const KR_RUNPOD_KEY: &str = "runpod-api-key";
 pub fn set_runpod_api_key(key: String) -> Result<(), String> {
     let key = key.trim();
     if key.is_empty() {
-        kr_del(KR_RUNPOD_KEY);
+        kr_del(KR_RUNPOD_KEY)?;
     } else {
         kr_set(KR_RUNPOD_KEY, key).map_err(|e| e.to_string())?;
     }
@@ -281,11 +291,15 @@ pub fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
     if !existed {
         return Err("notFound".into());
     }
+    // The keys go first, the secret before the access key: a connection is not
+    // removed while its keys cannot be, and a half-done removal leaves the less
+    // sensitive half behind.
+    forget_client(&id);
+    kr_del(&kr_sec(&id))?;
+    kr_del(&kr_acc(&id))?;
     conns.retain(|c| c.id != id);
     write_conns(&app, &conns)?;
     forget_client(&id);
-    kr_del(&kr_acc(&id));
-    kr_del(&kr_sec(&id));
     if read_active(&app).as_deref() == Some(id.as_str()) {
         let first = conns[0].id.clone();
         write_active(&app, &first)?;
@@ -296,7 +310,8 @@ pub fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
 /// Adds or updates one connection and returns its id.
 ///
 /// An empty `access_key` or `secret_key` leaves the stored key untouched, which
-/// is how the UI can show a saved connection without ever holding its secrets.
+/// is how the UI can show a saved connection without ever holding its secrets;
+/// a changed endpoint needs both keys again.
 /// A missing `id` means the active connection, so a first-run save creates one.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -311,6 +326,9 @@ pub fn save_connection(
     secret_key: Option<String>,
 ) -> Result<String, String> {
     migrate_if_needed(&app);
+    if let Some(code) = crate::core::endpoint_problem(&endpoint) {
+        return Err(code.into());
+    }
     let mut conns = read_conns(&app);
 
     let cid = id
@@ -319,6 +337,23 @@ pub fn save_connection(
         .unwrap_or_else(|| "conn-1".to_string());
 
     let existing = conns.iter().find(|c| c.id == cid).cloned();
+    // Stored keys stay with the endpoint they were saved for: a new endpoint
+    // needs both keys typed again, or saving would send the old ones there.
+    let typed = |k: &Option<String>| k.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if let Some(c) = &existing
+        && !crate::commands::same_endpoint(&c.endpoint, &endpoint)
+        && !(typed(&access_key) && typed(&secret_key))
+    {
+        return Err("keysRequired".into());
+    }
+    // Queued and running transfers find their connection by id when they run;
+    // pointing that id at another endpoint or bucket would move them there.
+    if let Some(c) = &existing
+        && (c.endpoint != endpoint || c.bucket != bucket)
+        && crate::transfers::connection_busy(&app, &cid)
+    {
+        return Err("busy".into());
+    }
     // An unnamed connection falls back to its bucket name, which is what the
     // sidebar would otherwise show as blank.
     let final_name = name
@@ -382,20 +417,15 @@ pub fn load_connection(app: AppHandle) -> ConnInfo {
     }
 }
 
-/// The stored keys a connection test should fall back to when the user left the
-/// key fields blank.
-pub fn stored_keys_for(
-    app: &AppHandle,
-    id: Option<&str>,
-) -> (Option<String>, Option<String>) {
-    let cid = id
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-        .or_else(|| active_id_inner(app));
-    match cid {
-        Some(i) => (kr_get(&kr_acc(&i)), kr_get(&kr_sec(&i))),
-        None => (kr_get(KR_OLD_ACCESS), kr_get(KR_OLD_SECRET)),
-    }
+/// The stored keys of one saved connection, for a test whose key fields were
+/// left blank. Whether they may be used is `test_connection`'s decision.
+pub fn stored_keys_for(id: &str) -> (Option<String>, Option<String>) {
+    (kr_get(&kr_acc(id)), kr_get(&kr_sec(id)))
+}
+
+/// The endpoint a connection was saved with.
+pub fn saved_endpoint(app: &AppHandle, id: &str) -> Option<String> {
+    read_conns(app).into_iter().find(|c| c.id == id).map(|c| c.endpoint)
 }
 
 // ── S3 client cache ──────────────────────────────────────────────────
@@ -416,6 +446,11 @@ fn forget_client(id: &str) {
 }
 
 fn client_for_entry(c: &ConnEntry) -> Result<(Client, String), BoxErr> {
+    // An endpoint saved before the https rule is refused here too. Only the code
+    // travels on: the address itself may hold a name and password.
+    if let Some(code) = crate::core::endpoint_problem(&c.endpoint) {
+        return Err(code.into());
+    }
     if let Some(hit) = clients().get(&c.id) {
         return Ok(hit.clone());
     }
@@ -440,6 +475,9 @@ pub fn active_client(app: &AppHandle) -> Result<(Client, String), BoxErr> {
         .or(conns.first())
         .filter(|c| !c.endpoint.is_empty() && !c.region.is_empty() && !c.bucket.is_empty())
         .ok_or("active connection is incomplete (missing endpoint, region, bucket or credentials)")?;
+    if let Some(code) = crate::core::endpoint_problem(&c.endpoint) {
+        return Err(code.into());
+    }
     client_for_entry(c).map_err(|_| {
         "active connection is incomplete (missing endpoint, region, bucket or credentials)".into()
     })

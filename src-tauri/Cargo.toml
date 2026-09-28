@@ -1,6 +1,6 @@
 [package]
 name = "bg-bucket-browser"
-version = "1.1.1"
+version = "1.2.0"
 authors = ["Bulent Gercek"]
 edition = "2024"
 license = "Apache-2.0"
@@ -74,9 +74,13 @@ sysinfo = { version = "0.39", default-features = false, features = ["disk", "sys
 # The volume has no trash of its own.
 trash = "5"
 
-# Packs downloaded objects into one archive, without compressing them: model
-# files do not compress, and the CPU time would be spent for nothing.
+# Reads back an archive "Download as ZIP" left, to resume it. The archive itself
+# is written by `zip_writer.rs`: this crate's writer loses the ZIP64 records of
+# large members when it reopens an archive to add to it.
 zip = { version = "2", default-features = false }
+
+# The CRC-32 of each archive member; already in the dependency tree.
+crc32fast = "1"
 
 # Decoding and scaling images for thumbnails. Only the formats the app actually
 # offers previews for are enabled, to keep the binary down; output is always
@@ -142,6 +146,10 @@ devtools = ["tauri/devtools"]
 # Wayland; everywhere else the safe default of "copy" stands.
 wl-clipboard-rs = "0.9"
 
+# Waits on the clipboard owner's pipe with a deadline (`poll`); already in the
+# dependency tree through other crates.
+libc = "0.2"
+
 # Dragging a file out of the window onto the desktop. Still a prototype: it is
 # reached from one temporary menu entry and nothing else.
 drag = "2"
@@ -162,3 +170,12 @@ winreg = "0.52"
 [target.'cfg(target_os = "macos")'.dependencies]
 # The keychain backend for this platform; see the note on the base dependency.
 keyring = { version = "3", features = ["apple-native"] }
+
+# Sets the quarantine attribute on downloaded files (`setxattr`); already in the
+# dependency tree through other crates.
+libc = "0.2"
+
+# The archive checksum runs over every byte of a "Download as ZIP"; unoptimized
+# it is several times slower, in the dev build and in the tests.
+[profile.dev.package.crc32fast]
+opt-level = 3

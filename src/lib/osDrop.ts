@@ -1,6 +1,6 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { groupPathsByDir } from "./osFiles";
-import { runTransfer } from "../state/transferQueueStore";
+import { activeConn, runTransfer } from "../state/transferQueueStore";
 import { usePaneStore, childPath } from "../state/paneStore";
 import { useUiStore } from "../state/uiStore";
 import { useOsDragStore } from "../state/osDragStore";
@@ -60,6 +60,7 @@ async function handleDrop(
   // A drop on a folder row goes into that folder, not into the open directory.
   const destPath = folder ? childPath(tab.path, folder) : tab.path;
 
+  const conn = activeConn(); // before anything waits (N7)
   let groups;
   try {
     groups = await groupPathsByDir(paths);
@@ -79,6 +80,7 @@ async function handleDrop(
         destPath,
         mode,
         fromLabel: t("route.os"), // how the queue names the source
+        conn,
       });
     }
   };

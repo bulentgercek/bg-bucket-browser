@@ -354,7 +354,8 @@ export default function Panel({ index }: { index: PaneIndex }) {
   // Right-clicking inside the selection acts on all of it; right-clicking
   // something else acts on that alone.
   const selTargets = (clicked: Entry): Entry[] => {
-    const sel = tab.listing.filter((e) => tab.selection.includes(e.name));
+    const selected = new Set(tab.selection); // a long selection in a long list
+    const sel = tab.listing.filter((e) => selected.has(e.name));
     return sel.some((e) => e.name === clicked.name) ? sel : [clicked];
   };
 
@@ -664,12 +665,14 @@ export default function Panel({ index }: { index: PaneIndex }) {
   const visibleNames = visible.map((v) => v.name);
   const selectAll = () => setSelection(index, visibleNames, null);
   const selectNone = () => setSelection(index, [], null);
-  const selectInvert = () =>
+  const selectInvert = () => {
+    const selected = new Set(tab.selection);
     setSelection(
       index,
-      visibleNames.filter((n) => !tab.selection.includes(n)),
+      visibleNames.filter((n) => !selected.has(n)),
       null,
     );
+  };
 
   const onRowClick = (e: ReactMouseEvent, entry: Entry) => {
     const sel = tab.selection;
@@ -792,34 +795,8 @@ export default function Panel({ index }: { index: PaneIndex }) {
     if (el) el.scrollTop = scrollTopRef.current;
   }, [tab.id, tab.path, tab.status]);
 
-  // ── Control and the wheel change the row or tile size ───────────
-  // Attached directly rather than through React, because the event has to be
-  // cancelled: otherwise the page zooms and the list scrolls at the same
-  // time.
-  useEffect(() => {
-    const el = sectionRef.current;
-    if (!el) return;
-    let lastAt = 0;
-    const onWheel = (e: WheelEvent) => {
-      if (!e.ctrlKey && !e.metaKey) return;
-      e.preventDefault();
-      const now = Date.now();
-      if (now - lastAt < 90) return; // a trackpad pinch sends far too many
-      lastAt = now;
-      const st = usePaneStore.getState().panes[index];
-      const tb = st.tabs.find((t) => t.id === st.activeTabId);
-      if (!tb) return;
-      const order: ViewSize[] = ["s", "m", "l"];
-      const cur = order.indexOf(tb.viewSize);
-      const next = Math.max(
-        0,
-        Math.min(order.length - 1, cur + (e.deltaY < 0 ? 1 : -1)),
-      );
-      if (next !== cur) setViewSize(index, order[next]);
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, [index, setViewSize]);
+  // Control with the wheel or + / - changes the row or tile size of the active
+  // pane; that lives in `lib/zoom.ts`, next to the window's own font size.
 
   // ── Moving around with the keyboard ────────────
   // The filter field, so a shortcut can put the cursor in it.
@@ -1013,6 +990,9 @@ export default function Panel({ index }: { index: PaneIndex }) {
         onClick={(e) => {
           if (e.target === e.currentTarget) selectNone();
         }}
+        // Entering counts as moving over: a pointer that stops just after
+        // crossing into the pane may report nothing more until it moves.
+        onDragEnter={onBodyDragOver}
         onDragOver={onBodyDragOver}
         onDragLeave={onBodyDragLeave}
         onDrop={onBodyDrop}
@@ -1030,6 +1010,8 @@ export default function Panel({ index }: { index: PaneIndex }) {
             entries={visible}
             filterActive={filterActive}
             viewSize={tab.viewSize}
+            cursorIndex={drawnCursor}
+            scrollRef={scrollBodyRef}
             onItemClick={onRowClick}
             onOpen={handleOpen}
             onContext={onRowContext}
@@ -1042,6 +1024,7 @@ export default function Panel({ index }: { index: PaneIndex }) {
         ) : (
           <div className="flex flex-col gap-px px-2 py-1">
             <ParentRow
+              side={pane.side}
               gridClass={gridClass}
               rowClass={rowClass}
               showModified={showModified}
@@ -1050,12 +1033,14 @@ export default function Panel({ index }: { index: PaneIndex }) {
             />
             <ListBody
               tab={tab}
+              side={pane.side}
               entries={visible}
               filterActive={filterActive}
               gridClass={gridClass}
               rowClass={rowClass}
               showModified={showModified}
               cursorIndex={drawnCursor}
+              scrollRef={scrollBodyRef}
               onItemClick={onRowClick}
               onOpen={handleOpen}
               onContext={onRowContext}

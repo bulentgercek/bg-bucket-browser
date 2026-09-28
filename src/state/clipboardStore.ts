@@ -76,6 +76,15 @@ function pathsSignature(paths: string[]): string {
     .join("\n");
 }
 
+/** The OS clipboard read still waiting for an answer. A poll that lands meanwhile
+    waits for it instead of starting another, so an owner that never answers
+    holds one read, not one per tick. */
+let osRead: Promise<void> | null = null;
+
+/** How long a read may go unanswered before the OS row it would refresh is
+    taken down: a row that can no longer be checked must not stay pasteable. */
+const OS_READ_STALE_MS = 3000;
+
 export const useClipboardStore = create<ClipboardState>((set, get) => ({
   clipboard: null,
   osClipboardTag: null,
@@ -105,36 +114,50 @@ export const useClipboardStore = create<ClipboardState>((set, get) => ({
     }
   },
   clearClipboard: () => set({ clipboard: null }),
-  refreshOsClipboard: async () => {
-    try {
-      const { paths, cut } = await readOsClipboardFiles();
-      const sig = paths.join("\n");
-      const { dismissedOsSignature: dismissed, seenOsSignature: seen, ownOsSignature: own } =
-        get();
-      // Our own echo?
-      const isOwn = paths.length > 0 && pathsSignature(paths) === own;
-      // Genuinely new content is compared against what was last seen, not
-      // against the row being shown: the row is cleared by every in-app copy,
-      // which used to make stale content look new again.
-      const isNewOsCopy = paths.length > 0 && sig !== dismissed && sig !== seen && !isOwn;
-      set((s) => {
-        // A new copy from outside takes the slot in turn.
-        const clipboard = isNewOsCopy ? null : s.clipboard;
-        return {
-          seenOsSignature: sig,
-          ownOsSignature: isNewOsCopy ? null : s.ownOsSignature,
-          clipboard,
-          // The row hides while the in-app clipboard holds the slot, and for
-          // our own echo: after a move, the files it names are no longer there.
-          osClipboardTag:
-            paths.length > 0 && sig !== dismissed && !clipboard && !isOwn
-              ? { kind: "files", paths, mode: cut ? "move" : "copy" }
-              : null,
-        };
-      });
-    } catch {
-      set({ osClipboardTag: null });
-    }
+  refreshOsClipboard: () => {
+    osRead ??= (async () => {
+      const stale = setTimeout(() => set({ osClipboardTag: null }), OS_READ_STALE_MS);
+      try {
+        const { paths, cut, known } = await readOsClipboardFiles();
+        // A read that could not finish says nothing about the clipboard: the
+        // row goes, and nothing else changes.
+        if (!known) {
+          set({ osClipboardTag: null });
+          return;
+        }
+        const sig = paths.join("\n");
+        const { dismissedOsSignature: dismissed, seenOsSignature: seen, ownOsSignature: own } =
+          get();
+        // Our own echo?
+        const isOwn = paths.length > 0 && pathsSignature(paths) === own;
+        // Genuinely new content is compared against what was last seen, not
+        // against the row being shown: the row is cleared by every in-app copy,
+        // which used to make stale content look new again.
+        const isNewOsCopy = paths.length > 0 && sig !== dismissed && sig !== seen && !isOwn;
+        set((s) => {
+          // A new copy from outside takes the slot in turn.
+          const clipboard = isNewOsCopy ? null : s.clipboard;
+          return {
+            seenOsSignature: sig,
+            ownOsSignature: isNewOsCopy ? null : s.ownOsSignature,
+            clipboard,
+            // The row hides while the in-app clipboard holds the slot, and for
+            // our own echo: after a move, the files it names are no longer there.
+            osClipboardTag:
+              paths.length > 0 && sig !== dismissed && !clipboard && !isOwn
+                ? { kind: "files", paths, mode: cut ? "move" : "copy" }
+                : null,
+          };
+        });
+      } catch {
+        set({ osClipboardTag: null });
+      } finally {
+        clearTimeout(stale);
+      }
+    })().finally(() => {
+      osRead = null;
+    });
+    return osRead;
   },
   clearOsClipboardTag: () =>
     set((s) => ({

@@ -1,21 +1,26 @@
-import { type MouseEvent as ReactMouseEvent } from "react";
+import {
+  memo,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type MouseEvent as ReactMouseEvent,
+  type RefObject,
+} from "react";
 import {
   ArrowBendLeftUpIcon,
-  FolderIcon,
-  FolderOpenIcon,
-  FileIcon,
-  FileTextIcon,
-  FileZipIcon,
-  FilmStripIcon,
   CaretDownIcon,
   CaretUpIcon,
 } from "@phosphor-icons/react";
-import { type Entry, type TabState } from "../../state/paneStore";
+import { type Entry, type PaneSide, type TabState } from "../../state/paneStore";
 import { formatDate, formatSize } from "../../lib/format";
 import { type SortKey, type SortState } from "../../lib/entries";
 import { t } from "../../locale/en";
 import { type RowDnd } from "./rowDnd";
+import { type RowHandlers, useRowHandlers } from "./rowHandlers";
+import { useVirtualRows } from "./useVirtualRows";
+import { SELECTION } from "./selectionColors";
 import { RenameInput } from "./RenameInput";
+import { entryIcon } from "./EntryIcon";
 import { type StateOpts, bodyStateRow } from "./BodyState";
 
 /* The details view: a header row and one row per entry. */
@@ -24,12 +29,14 @@ import { type StateOpts, bodyStateRow } from "./BodyState";
    empty folder. The `..` row is drawn above this and is not part of it. */
 export function ListBody({
   tab,
+  side,
   entries,
   filterActive,
   gridClass,
   rowClass,
   showModified,
   cursorIndex,
+  scrollRef,
   onItemClick,
   onOpen,
   onContext,
@@ -39,6 +46,8 @@ export function ListBody({
   stateOpts,
 }: {
   tab: TabState;
+  /** Which side the pane is; its folders are drawn in that side's colour. */
+  side: PaneSide;
   /** The entries as the tab shows them: filtered and sorted. */
   entries: Entry[];
   filterActive: boolean;
@@ -47,6 +56,8 @@ export function ListBody({
   showModified: boolean;
   /** Which visible row the keyboard cursor is on, or a value matching none. */
   cursorIndex: number;
+  /** The pane's scrolling body, which decides which rows are drawn. */
+  scrollRef: RefObject<HTMLDivElement | null>;
   onItemClick: (e: ReactMouseEvent, entry: Entry) => void;
   onOpen: (entry: Entry) => void;
   onContext: (e: ReactMouseEvent, entry: Entry) => void;
@@ -55,29 +66,49 @@ export function ListBody({
   dnd: RowDnd;
   stateOpts: StateOpts;
 }) {
+  const handlers = useRowHandlers({
+    onItemClick,
+    onOpen,
+    onContext,
+    onRenameCommit,
+    onRenameCancel,
+    dnd,
+  });
+  // Every row asks whether it is selected on every draw; a set answers that
+  // in constant time however much is selected.
+  const selected = useMemo(() => new Set(tab.selection), [tab.selection]);
   const sr = bodyStateRow(tab, filterActive, entries.length === 0, stateOpts);
+  const listRef = useRef<HTMLDivElement>(null);
+  const v = useVirtualRows(scrollRef, listRef, !sr, entries.length, 0);
+  // A cursor moved to a row that is not drawn yet is brought on screen here;
+  // the pane's own scrolling can only reach rows that are on the page.
+  const { reveal } = v;
+  useLayoutEffect(() => {
+    if (cursorIndex >= 0) reveal(cursorIndex);
+  }, [cursorIndex, reveal]);
   if (sr) return <>{sr}</>;
   return (
-    <>
-      {entries.map((entry, i) => (
+    <div
+      ref={listRef}
+      className="flex flex-col gap-px"
+      style={{ paddingTop: v.padTop, paddingBottom: v.padBottom }}
+    >
+      {entries.slice(v.first, v.last + 1).map((entry, k) => (
         <FileRow
           key={entry.name}
           entry={entry}
+          side={side}
           gridClass={gridClass}
           rowClass={rowClass}
           showModified={showModified}
-          selected={tab.selection.includes(entry.name)}
-          cursor={cursorIndex === i}
+          selected={selected.has(entry.name)}
+          cursor={cursorIndex === v.first + k}
           renaming={tab.renaming === entry.name}
-          onClick={(e) => onItemClick(e, entry)}
-          onOpen={() => onOpen(entry)}
-          onContext={(e) => onContext(e, entry)}
-          onRenameCommit={(v) => onRenameCommit(entry, v)}
-          onRenameCancel={onRenameCancel}
-          dnd={dnd}
+          dropOn={entry.kind === "dir" && dnd.dropTarget === entry.name}
+          handlers={handlers}
         />
       ))}
-    </>
+    </div>
   );
 }
 
@@ -119,12 +150,15 @@ export function ColHeader({
 }
 
 export function ParentRow({
+  side,
   gridClass,
   rowClass,
   showModified,
   cursor,
   onOpen,
 }: {
+  /** Which side the pane is; the cursor is drawn in its colour. */
+  side: PaneSide;
   gridClass: string;
   rowClass: string;
   showModified: boolean;
@@ -142,7 +176,7 @@ export function ParentRow({
       className={
         `${gridClass} items-center rounded-sm px-2 ${rowClass} ` +
         (cursor
-          ? "outline outline-1 -outline-offset-1 outline-accent-400 hover:bg-neutral-900"
+          ? `outline outline-1 -outline-offset-1 ${SELECTION[side].cursor} hover:bg-neutral-900`
           : "hover:bg-neutral-900")
       }
     >
@@ -157,28 +191,26 @@ export function ParentRow({
 }
 
 function fileGlyph(entry: Entry, className: string) {
-  if (entry.glyph === "text") return <FileTextIcon size={15} className={className} />;
-  if (entry.glyph === "zip") return <FileZipIcon size={15} className={className} />;
-  if (entry.glyph === "video") return <FilmStripIcon size={15} className={className} />;
-  return <FileIcon size={15} className={className} />;
+  return entryIcon(entry.glyph ?? "file", 15, className);
 }
 
-function FileRow({
+/* One row. Memoised: a row is drawn again only when something it shows
+   changes, so hovering a pane or selecting a row redraws a handful of rows
+   rather than all of them. */
+const FileRow = memo(function FileRow({
   entry,
+  side,
   gridClass,
   rowClass,
   showModified,
   selected,
   cursor,
   renaming,
-  onClick,
-  onOpen,
-  onContext,
-  onRenameCommit,
-  onRenameCancel,
-  dnd,
+  dropOn,
+  handlers,
 }: {
   entry: Entry;
+  side: PaneSide;
   gridClass: string;
   rowClass: string;
   showModified: boolean;
@@ -186,21 +218,23 @@ function FileRow({
   /** Whether the keyboard cursor is on this row, selected or not. */
   cursor: boolean;
   renaming: boolean;
-  onClick: (e: ReactMouseEvent) => void;
-  onOpen: () => void;
-  onContext: (e: ReactMouseEvent) => void;
-  onRenameCommit: (value: string) => void;
-  onRenameCancel: () => void;
-  dnd: RowDnd;
+  /** Whether something dragged is over this row, which is a folder. */
+  dropOn: boolean;
+  handlers: RowHandlers;
 }) {
   const isDir = entry.kind === "dir";
-  const dropOn = isDir && dnd.dropTarget === entry.name;
+  // Folders take their side's colour, like the pane's frame and its tab and
+  // path icons, so the list itself says which side it is on. A selected row
+  // keeps the selection's colour throughout.
+  const sel = SELECTION[side];
   const iconColor = selected
-    ? "text-accent-300"
+    ? sel.detail
     : isDir
-      ? "text-accent-400"
+      ? side === "remote"
+        ? "text-accent-400"
+        : "text-local-400"
       : "text-neutral-500";
-  const metaColor = selected ? "text-accent-300" : "text-neutral-500";
+  const metaColor = selected ? sel.detail : "text-neutral-500";
 
   return (
     <div
@@ -208,13 +242,15 @@ function FileRow({
       data-kind={entry.kind}
       data-cursor={cursor || undefined}
       draggable={!renaming}
-      onDragStart={(e) => dnd.onDragStart(e, entry)}
-      onDragEnd={dnd.onDragEnd}
-      onDragOver={isDir ? (e) => dnd.onDirDragOver(e, entry) : undefined}
-      onDrop={isDir ? (e) => dnd.onDirDrop(e, entry) : undefined}
-      onClick={onClick}
-      onDoubleClick={onOpen}
-      onContextMenu={onContext}
+      onDragStart={(e) => handlers.dragStart(e, entry)}
+      onDragEnd={handlers.dragEnd}
+      // Entering counts as moving over, as it does for the pane.
+      onDragEnter={isDir ? (e) => handlers.dirDragOver(e, entry) : undefined}
+      onDragOver={isDir ? (e) => handlers.dirDragOver(e, entry) : undefined}
+      onDrop={isDir ? (e) => handlers.dirDrop(e, entry) : undefined}
+      onClick={(e) => handlers.click(e, entry)}
+      onDoubleClick={() => handlers.open(entry)}
+      onContextMenu={(e) => handlers.context(e, entry)}
       className={
         `${gridClass} items-center rounded-sm px-2 transition-colors duration-150 ${rowClass} ` +
         (dropOn
@@ -222,26 +258,24 @@ function FileRow({
           : cursor
             ? // The cursor outline is brighter than the selection outline, so
               // it stays visible on a row that is also selected.
-              (selected ? "bg-accent-900 text-accent-100 " : "hover:bg-neutral-900 ") +
-              "outline outline-1 -outline-offset-1 outline-accent-400"
+              (selected ? `${sel.fill} ${sel.text} ` : "hover:bg-neutral-900 ") +
+              `outline outline-1 -outline-offset-1 ${sel.cursor}`
             : selected
-              ? "bg-accent-900 text-accent-100 outline outline-1 -outline-offset-1 outline-accent-600"
+              ? `${sel.fill} ${sel.text} outline outline-1 -outline-offset-1 ${sel.rowOutline}`
               : "hover:bg-neutral-900")
       }
     >
       <span className="flex min-w-0 items-center gap-2">
-        {isDir && selected ? (
-          <FolderOpenIcon size={15} className={`shrink-0 ${iconColor}`} />
-        ) : isDir ? (
-          <FolderIcon size={15} className={`shrink-0 ${iconColor}`} />
+        {isDir ? (
+          entryIcon(selected ? "folderOpen" : "folder", 15, iconColor)
         ) : (
           <span className="shrink-0">{fileGlyph(entry, iconColor)}</span>
         )}
         {renaming ? (
           <RenameInput
             initial={entry.name}
-            onCommit={onRenameCommit}
-            onCancel={onRenameCancel}
+            onCommit={(v) => handlers.renameCommit(entry, v)}
+            onCancel={handlers.renameCancel}
           />
         ) : (
           <span className="truncate">{entry.name}</span>
@@ -257,7 +291,7 @@ function FileRow({
       )}
     </div>
   );
-}
+});
 
 /* ── The tile view. Selecting, opening, renaming and dragging all behave as
    they do in the list; only the layout is different. ── */

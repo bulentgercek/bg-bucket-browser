@@ -45,6 +45,13 @@ pub fn is_open_here_registered() -> bool {
     }
 }
 
+/// Rewrites an existing "Open in" entry whose command an older version wrote.
+/// Only macOS has one to rewrite; elsewhere this does nothing.
+pub fn refresh_open_here() {
+    #[cfg(target_os = "macos")]
+    macos::refresh();
+}
+
 /// Creates the registration or removes it.
 #[tauri::command]
 pub fn register_open_here(enable: bool) -> Result<(), String> {
@@ -176,15 +183,20 @@ mod windows {
     }
 }
 
+/// The app's bundle identifier, the same as `identifier` in `tauri.conf.json`;
+/// macOS finds the installed app by it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const BUNDLE_ID: &str = "com.bulentgercek.bgbucketbrowser";
+
 #[cfg(target_os = "macos")]
 mod macos {
     //! A Services entry under `~/Library/Services/`, which is what actually puts
     //! the app in Finder's right-click menu for a folder.
     //!
-    //! The workflow runs a single shell action, `open -a "<bundle>" "$1"`, with
-    //! the folder arriving as the first argument. The bundle path is derived
-    //! from the running executable rather than from the app's name, so a renamed
-    //! or moved app still works.
+    //! The workflow runs a single shell action, `open -b <bundle id> "$1"`, with
+    //! the folder arriving as the first argument. Launch Services finds the app
+    //! by its bundle identifier wherever it is installed, so a moved app still
+    //! works and no path ever goes into the command.
     //!
     //! Like the other two platforms this is user-level and needs no admin, and
     //! the toggle in Settings writes and removes it at runtime.
@@ -201,30 +213,25 @@ mod macos {
         Ok(home.join("Library/Services").join(WORKFLOW_NAME))
     }
 
-    /// The `.app` bundle around the running binary, three levels up.
-    ///
-    /// Only meaningful in a packaged build: during development the binary sits
-    /// in the target directory and is inside no bundle at all, so this feature
-    /// can only be tested from a real build.
-    fn app_bundle_path() -> Result<PathBuf, String> {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        exe.parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .ok_or_else(|| "could not resolve .app bundle path".to_string())
-    }
-
-    /// Escapes the path for XML text content.
-    fn xml_escape(s: &str) -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-    }
-
     pub fn is_registered() -> bool {
         workflow_dir().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// Writes the workflow again when it is there with a command other than
+    /// today's, so the Finder entry keeps up with the app.
+    pub fn refresh() {
+        let Ok(dir) = workflow_dir() else { return };
+        let Ok(current) = fs::read_to_string(dir.join("Contents/document.wflow")) else {
+            return;
+        };
+        if !current.contains(&command()) {
+            let _ = register(true);
+        }
+    }
+
+    /// The shell action of the workflow.
+    fn command() -> String {
+        format!("open -b {} \"$1\"", super::BUNDLE_ID)
     }
 
     pub fn register(enable: bool) -> Result<(), String> {
@@ -235,11 +242,9 @@ mod macos {
             return Ok(());
         }
 
-        let app_path = app_bundle_path()?;
-        let command = format!(
-            "open -a \"{}\" \"$1\"",
-            xml_escape(&app_path.to_string_lossy())
-        );
+        // The command names the app by its bundle identifier, a fixed string with
+        // no shell or XML meaning, instead of the path it was started from.
+        let command = command();
 
         // Automator's own export also contains an empty `Contents/QuickLook/`
         // directory; it only feeds Finder's preview and is left out.
@@ -532,5 +537,16 @@ mod macos {
 </plist>
 "#
         )
+    }
+}
+
+#[cfg(test)]
+mod bundle_id_tests {
+    // The constant and the configuration must name the same app.
+    #[test]
+    fn the_bundle_id_matches_the_tauri_configuration() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(conf["identifier"], super::BUNDLE_ID);
     }
 }

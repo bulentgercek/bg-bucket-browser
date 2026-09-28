@@ -13,6 +13,9 @@ const ERROR_KEY: Record<ListErrKind, StringKey> = {
   unreachable: "panel.error.unreachable",
   credentials: "panel.error.credentials",
   io: "panel.error.io",
+  endpoint: "panel.error.endpoint",
+  canceled: "panel.error.canceled",
+  tooLarge: "panel.error.tooLarge",
   unknown: "panel.error.unknown",
 };
 
@@ -78,11 +81,16 @@ export function bodyStateRow(
   }
   if (tab.status === "loading") return <StateRow text={t("panel.loading")} />;
   if (tab.status === "error") {
+    // An endpoint the app refuses is fixed in Settings; retrying cannot help.
+    const fix =
+      tab.error === "endpoint"
+        ? { label: t("panel.openSettings"), onClick: opts.onOpenSettings }
+        : { label: t("panel.retry"), onClick: opts.onRetry };
     return (
       <StateRow
         text={t(ERROR_KEY[tab.error ?? "unknown"])}
         tone="error"
-        actions={[{ label: t("panel.retry"), onClick: opts.onRetry }]}
+        actions={[fix]}
       />
     );
   }

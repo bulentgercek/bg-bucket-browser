@@ -293,7 +293,12 @@ function OverflowChip({
                   <DesktopTowerIcon size={14} className="shrink-0 text-local-400" />
                 )
               ) : (
-                <FolderIcon size={14} className="shrink-0 text-accent-400" />
+                <FolderIcon
+                  size={14}
+                  className={
+                    "shrink-0 " + (remote ? "text-accent-400" : "text-local-400")
+                  }
+                />
               )}
               <span className="truncate">{crumb.label}</span>
             </button>

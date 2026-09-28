@@ -11,6 +11,7 @@ import { persistStorage } from "../lib/persist";
 
 export type Screen = "main" | "settings";
 export type Theme = "dark" | "light" | "system";
+export type FontSize = "small" | "medium" | "large" | "xlarge";
 export type SettingsTab = "connections" | "appearance" | "feedback" | "about";
 
 // Neither pane may shrink away completely.
@@ -48,6 +49,11 @@ interface UiState {
       while the app is open. */
   theme: Theme;
   setTheme: (theme: Theme) => void;
+
+  /** How large the whole window is drawn; medium is the size the app was
+      designed at. */
+  fontSize: FontSize;
+  setFontSize: (size: FontSize) => void;
 
   /** What a file dropped from outside does: copy straight away, or ask.
       Copying is the default because a move would delete the user's own file
@@ -95,6 +101,9 @@ export const useUiStore = create<UiState>()(
       theme: "dark",
       setTheme: (theme) => set({ theme }),
 
+      fontSize: "medium",
+      setFontSize: (fontSize) => set({ fontSize }),
+
       osDropMode: "copy",
       setOsDropMode: (mode) => set({ osDropMode: mode }),
 
@@ -122,6 +131,7 @@ export const useUiStore = create<UiState>()(
         splitRatio: s.splitRatio,
         showHidden: s.showHidden,
         theme: s.theme,
+        fontSize: s.fontSize,
         osDropMode: s.osDropMode,
       }),
     },

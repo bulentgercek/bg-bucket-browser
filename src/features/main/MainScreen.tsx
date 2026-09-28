@@ -201,12 +201,18 @@ export default function MainScreen() {
         e.preventDefault();
         reloadPanes(false);
       } else if (e.key === "F5" || e.key === "F6") {
+        // The webview's own meaning (F5 reloads the page on Windows) never
+        // applies, active pane or not.
+        e.preventDefault();
         // These act on the active pane, and the sidebar is not one.
         const ap = useUiStore.getState().activePane;
         if (ap === null) return;
         // The selection, or the row under the keyboard cursor, goes to the
         // other pane; the second key moves it.
-        e.preventDefault();
+        // A tab that is loading shows no rows, so there is nothing to send yet.
+        const pane = usePaneStore.getState().panes[ap];
+        const tab = pane.tabs.find((tb) => tb.id === pane.activeTabId) ?? pane.tabs[0];
+        if (tab.status !== "ready") return;
         startPaneTransfer(ap, e.key === "F6", keyboardTargets(ap));
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v") {
         // Paste shares its path with the context menu entry. In a text field

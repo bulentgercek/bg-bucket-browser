@@ -118,7 +118,15 @@ fn read_answer(status: u16, body: &str) -> Result<String, FeedbackErr> {
             .map(str::to_string)
     };
     match status {
-        200..=299 => str_field("id").ok_or_else(|| FeedbackErr::new("server")),
+        // The id is shown in a toast and written to the log, so only a short,
+        // plain one is taken; the service sends eight hex digits.
+        200..=299 => str_field("id")
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 64
+                    && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+            .ok_or_else(|| FeedbackErr::new("server")),
         400 => Err(FeedbackErr { kind: "invalid", field: str_field("field") }),
         413 => Err(FeedbackErr::new("tooLarge")),
         429 => Err(FeedbackErr::new("rateLimited")),
@@ -221,7 +229,17 @@ pub async fn feedback_send(
             FeedbackErr::new("network")
         })?;
     let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
+    // The service answers with a few dozen bytes; a longer answer is cut off
+    // and then fails to parse, which reads as a server error.
+    let mut resp = resp;
+    let mut raw = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        raw.extend_from_slice(&chunk);
+        if raw.len() > 64 * 1024 {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&raw).into_owned();
     let answer = read_answer(status, &text);
     devlog::verbose("feedback", format!("answer {status} {answer:?}"));
 
@@ -236,6 +254,14 @@ mod tests {
     use super::*;
 
     const START: &str = "=== recording start 2026-09-25 10:00:00.000 v1.1.0 linux ===";
+
+    #[test]
+    fn an_answer_id_is_short_and_plain() {
+        assert_eq!(read_answer(200, r#"{"id":"fb_01HX2Y"}"#).unwrap(), "fb_01HX2Y");
+        let long = format!(r#"{{"id":"{}"}}"#, "a".repeat(200));
+        assert!(read_answer(200, &long).is_err());
+        assert!(read_answer(200, r#"{"id":"a\nb"}"#).is_err());
+    }
 
     #[test]
     fn a_recording_that_fits_is_sent_whole() {

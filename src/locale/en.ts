@@ -109,6 +109,7 @@ export const en = {
   "fs.error.unsupported": "That isn't supported here",
   "fs.error.io": "Could not complete the operation",
   "fs.error.s3": "The server rejected the operation",
+  "fs.error.canceled": "Stopped",
   "fs.error.unknown": "Something went wrong",
 
   // OS entegrasyonu
@@ -156,6 +157,10 @@ export const en = {
   "panel.error.unreachable": "Could not reach the network volume",
   "panel.error.credentials": "The volume refused these credentials",
   "panel.error.io": "Could not read the folder",
+  "panel.error.endpoint":
+    "This connection's endpoint is not allowed: use https:// (plain http:// only for localhost)",
+  "panel.error.canceled": "Loading stopped",
+  "panel.error.tooLarge": "This folder is too large to list: it holds more than a million entries",
   "panel.error.unknown": "Could not load the folder",
 
   "statusbar.selection": "{count} of {total} selected",
@@ -243,6 +248,14 @@ export const en = {
   "settings.connections.rename": "Rename",
   "settings.connections.renameWithBucket": "Rename with bucket ID",
   "settings.connections.active": "active",
+  "settings.connections.insecureEndpoint":
+    "Not saved: plain http:// is allowed only for this computer (localhost). Use https://",
+  "settings.connections.badEndpoint":
+    "Not saved: the endpoint should look like https://host",
+  "settings.connections.keysRequired":
+    "Not saved: a new endpoint needs the access key and the secret key again",
+  "settings.connections.busy":
+    "This connection has transfers waiting or running. Change its endpoint or bucket once they finish, or cancel them first.",
   "settings.connections.delete": "Delete connection",
   "settings.connections.discard": "Discard",
   "settings.connections.deleteTitle": "Delete connection?",
@@ -260,7 +273,7 @@ export const en = {
 
   "settings.maintenance.label": "Interrupted uploads",
   "settings.maintenance.subline":
-    "Canceled or failed uploads leave partial data on the volume. Old ones (7+ days) are cleared automatically on launch.",
+    "Canceled or failed uploads leave partial data on the volume. Nothing clears it automatically; scan and remove it here.",
   "settings.maintenance.scan": "Scan for interrupted uploads",
   "settings.maintenance.scanning": "Scanning…",
   "settings.maintenance.none": "Nothing to clean up",
@@ -277,6 +290,7 @@ export const en = {
   "settings.runpod.save": "Save",
   "settings.runpod.saved": "RunPod API key saved",
   "settings.runpod.cleared": "RunPod API key removed",
+  "settings.runpod.remove": "Remove",
   "dialog.cleanUpTitle": "Clean up interrupted uploads?",
   "dialog.cleanUpBody":
     "{count} unfinished upload(s) ({size}) will be aborted on the network volume. Any that you plan to resume will have to start over. This can't be undone.",
@@ -304,12 +318,17 @@ export const en = {
   "cleanup.reclaimableEmpty": "No obvious junk found.",
   "cleanup.skipped": "Not scanned",
   "cleanup.skippedHint": ".git, node_modules and site-packages folders are not counted.",
+  "cleanup.skippedMore": "{shown} of {count} are listed.",
+  "cleanup.reclaimableMore":
+    "The {shown} largest of {count} reclaimable objects ({size}) are listed. Delete them and scan again for the rest.",
   "cleanup.selectAllReclaimable": "Select all reclaimable",
   "cleanup.clearSelection": "Clear selection",
   "cleanup.selectedSummary": "{count} selected · {size}",
   "cleanup.deleteSelected": "Delete selected",
   "cleanup.deleting": "Deleting…",
   "cleanup.deleted": "{count} object(s) deleted.",
+  "cleanup.keptChanged": "{count} changed since the scan and were kept.",
+  "cleanup.deleteFailed": "{count} could not be deleted.",
   "cleanup.confirmTitle": "Delete {count} object(s)?",
   "cleanup.confirmBody":
     "This permanently deletes the selected objects from the bucket — S3 has no trash, this can't be undone.",
@@ -326,6 +345,17 @@ export const en = {
   "settings.theme.dark": "Dark",
   "settings.theme.light": "Light",
   "settings.theme.system": "System",
+
+  "settings.fontSize.label": "Font size",
+  // Non-breaking spaces keep each shortcut on one line.
+  "settings.fontSize.subline":
+    "Applies to the whole window. Ctrl + / - and Ctrl + mouse wheel change it too, except in a panel, where they size its rows and tiles.",
+  "settings.fontSize.subline.mac":
+    "Applies to the whole window. Cmd + / - and Cmd + mouse wheel change it too, except in a panel, where they size its rows and tiles.",
+  "settings.fontSize.small": "Small",
+  "settings.fontSize.medium": "Medium",
+  "settings.fontSize.large": "Large",
+  "settings.fontSize.xlarge": "Extra Large",
 
   "settings.action.revert": "Revert",
   "settings.action.save": "Save",
@@ -345,7 +375,10 @@ export const en = {
   "testError.badRequest":
     "Could not build the request — the endpoint URL may be malformed",
   "testError.noCredentials":
-    "No credentials — enter the access and secret key, or Save first",
+    "No credentials — enter the access and secret key",
+  "testError.insecureEndpoint":
+    "Plain http:// is allowed only for this computer (localhost) — use https://",
+  "testError.badEndpoint": "Not a valid endpoint — it should look like https://host",
   "testError.unknown": "Connection failed",
 
   "feedback.heading": "Feedback",

@@ -13,6 +13,26 @@ import {
   registerKeyboardTargets,
 } from "../../lib/keyboardTargets";
 
+/** How the icon grid of pane `index` is laid out right now: tiles per row, and
+    how many tiles one screen holds. Both follow the pane's width and the tile
+    size, so they are read from the page at the moment a key is pressed. */
+function iconGrid(index: PaneIndex): { cols: number; page: number } {
+  const grid = document.querySelector<HTMLElement>(
+    `[data-pane="${index}"] [data-icon-grid]`,
+  );
+  if (!grid) return { cols: 1, page: 1 };
+  const style = getComputedStyle(grid);
+  const cols = Math.max(
+    1,
+    style.gridTemplateColumns.split(" ").filter(Boolean).length,
+  );
+  const tile = grid.firstElementChild as HTMLElement | null;
+  const rowHeight = tile ? tile.offsetHeight + (parseFloat(style.rowGap) || 0) : 0;
+  const view = grid.parentElement?.clientHeight ?? 0; // the pane's scrolling body
+  const rows = rowHeight > 0 ? Math.max(1, Math.floor(view / rowHeight)) : 1;
+  return { cols, page: cols * rows };
+}
+
 /* Moving around a pane with the keyboard, and what its keyboard actions act on.
 
    Bound to the window and acting only while this pane is the active one, the
@@ -79,10 +99,7 @@ export function usePaneKeyboard({
   // The cursor as this render draws it: its row, -1 on `..`, -2 when none is
   // drawn. Keyboard actions read this rather than the flag above, because the
   // flag can change without a render and would then disagree with the screen.
-  const drawnCursor =
-    active && kbActive.current && tab.viewMode === "details"
-      ? tab.cursorIndex
-      : -2;
+  const drawnCursor = active && kbActive.current ? tab.cursorIndex : -2;
   const drawnCursorRef = useRef(drawnCursor);
   drawnCursorRef.current = drawnCursor;
 
@@ -140,7 +157,13 @@ export function usePaneKeyboard({
 
       const st = usePaneStore.getState().panes[index];
       const cur = st.tabs.find((tb) => tb.id === st.activeTabId);
-      if (!cur || cur.status !== "ready" || cur.viewMode !== "details") return;
+      if (!cur || cur.status !== "ready") return;
+
+      // A tile the mouse clicked keeps the focus; moving with the keys would
+      // otherwise draw its focus ring next to the cursor.
+      if (ae?.tagName === "BUTTON" && ae.closest(`[data-pane="${index}"]`)) {
+        ae.blur();
+      }
 
       const rows = visibleRef.current;
       const names = rows.map((r) => r.name);
@@ -150,11 +173,36 @@ export function usePaneKeyboard({
       const clamp = (n: number) => Math.max(-1, Math.min(max, n));
       const clampRow = (n: number) => Math.max(0, Math.min(max, n)); // entries only, not `..`
 
+      // The details view is one column. In the icon view the arrows move in
+      // two directions, and up and down skip a whole row of tiles; `..` is
+      // the first tile.
+      const icons = cur.viewMode === "icons";
+      const grid = icons ? iconGrid(index) : { cols: 1, page: PAGE };
+      const rowOf = (i: number) => Math.floor((i + 1) / grid.cols);
+      const vertical = (from: number, dir: 1 | -1) => {
+        const to = from + dir * grid.cols;
+        if (to < -1) return from; // no row above
+        // Past the end, a shorter last row still takes the cursor to its
+        // last tile; from the last row itself it stays put.
+        if (to > max) return rowOf(max) > rowOf(from) ? max : from;
+        return to;
+      };
+      const move = (from: number, key: string): number => {
+        if (key === "ArrowDown") return vertical(from, 1);
+        if (key === "ArrowUp") return vertical(from, -1);
+        if (key === "ArrowRight") return clamp(from + 1);
+        if (key === "ArrowLeft") return clamp(from - 1);
+        return from;
+      };
+      const arrow =
+        e.key === "ArrowDown" ||
+        e.key === "ArrowUp" ||
+        (icons && (e.key === "ArrowLeft" || e.key === "ArrowRight"));
+
       // Consecutive shift-arrows extend one block from one anchor; any other
       // key ends that, and the next shift-arrow starts a new block from wherever
       // the cursor is now.
-      const shiftArrow =
-        (e.key === "ArrowDown" || e.key === "ArrowUp") && e.shiftKey;
+      const shiftArrow = arrow && e.shiftKey;
       if (!shiftArrow) shiftGesture.current = false;
 
       // The control shortcuts were handled above.
@@ -168,7 +216,7 @@ export function usePaneKeyboard({
         kbActive.current = true;
         if (max < 0) return;
         const from = c < 0 ? 0 : c;
-        const to = clampRow(from + (e.key === "ArrowDown" ? 1 : -1));
+        const to = clampRow(move(from, e.key));
         // A new block anchors where the cursor is; an ongoing one keeps its
         // anchor.
         let anchor = shiftGesture.current ? cur.anchor : null;
@@ -182,17 +230,14 @@ export function usePaneKeyboard({
         return;
       }
 
+      if (arrow) {
+        e.preventDefault();
+        kbActive.current = true;
+        setCursor(index, move(c, e.key));
+        return;
+      }
+
       switch (e.key) {
-        case "ArrowDown":
-          e.preventDefault();
-          kbActive.current = true;
-          setCursor(index, clamp(c + 1));
-          break;
-        case "ArrowUp":
-          e.preventDefault();
-          kbActive.current = true;
-          setCursor(index, clamp(c - 1));
-          break;
         case " ": {
           // Space toggles the row under the cursor, as a control-click does;
           // with no cursor on screen there is nothing to toggle.
@@ -235,12 +280,12 @@ export function usePaneKeyboard({
         case "PageDown":
           e.preventDefault();
           kbActive.current = true;
-          setCursor(index, clamp(c + PAGE));
+          setCursor(index, clamp(c + grid.page));
           break;
         case "PageUp":
           e.preventDefault();
           kbActive.current = true;
-          setCursor(index, clamp(c - PAGE));
+          setCursor(index, clamp(c - grid.page));
           break;
         case "Home":
           e.preventDefault();
@@ -321,6 +366,8 @@ export function usePaneKeyboard({
     registerKeyboardTargets(index, () => {
       const st = usePaneStore.getState().panes[index];
       const tb = st.tabs.find((x) => x.id === st.activeTabId) ?? st.tabs[0];
+      // While the tab loads, its old rows are not on screen: nothing is a target.
+      if (tb.status !== "ready") return [];
       const selected = tb.listing.filter((en) => tb.selection.includes(en.name));
       if (selected.length > 0) return selected;
       // On `..` (-1) or with no cursor drawn (-2) there is no entry.

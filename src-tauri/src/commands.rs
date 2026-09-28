@@ -30,6 +30,10 @@ pub enum TestErrKind {
     BadResponse,
     BadRequest,
     NoCredentials,
+    /// The endpoint is plain `http` to another machine.
+    InsecureEndpoint,
+    /// The endpoint is not an `https://` or `http://` address.
+    BadEndpoint,
     Unknown,
 }
 
@@ -66,7 +70,8 @@ fn classify_kind<R>(e: &SdkError<ListObjectsV2Error, R>, code: Option<&str>) -> 
 /// Connects with the form's values and lists one key to prove access.
 ///
 /// Blank keys fall back to the ones saved in the keychain for this connection,
-/// since the form never receives stored secrets.
+/// since the form never receives stored secrets, but only while the form still
+/// points at the endpoint they were saved for. A draft brings its own keys.
 #[tauri::command]
 pub async fn test_connection(
     app: AppHandle,
@@ -77,16 +82,29 @@ pub async fn test_connection(
     access_key: Option<String>,
     secret_key: Option<String>,
 ) -> Result<TestOk, TestErr> {
+    if let Some(code) = crate::core::endpoint_problem(&endpoint) {
+        let kind = if code == "insecureEndpoint" {
+            TestErrKind::InsecureEndpoint
+        } else {
+            TestErrKind::BadEndpoint
+        };
+        return Err(TestErr { kind, detail: String::new(), code: None, http_status: None });
+    }
     let nonblank = |o: Option<String>| o.filter(|s| !s.trim().is_empty());
-    let (saved_ak, saved_sk) =
-        crate::config::stored_keys_for(&app, id.as_deref());
+    let id = id.filter(|s| !s.is_empty());
+    let saved_endpoint = id.as_deref().and_then(|i| crate::config::saved_endpoint(&app, i));
+    let (saved_ak, saved_sk) = match id.as_deref() {
+        Some(i) if may_use_stored_keys(saved_endpoint.as_deref(), &endpoint) => {
+            crate::config::stored_keys_for(i)
+        }
+        _ => (None, None),
+    };
     let access_key = nonblank(access_key).or(saved_ak);
     let secret_key = nonblank(secret_key).or(saved_sk);
     let (Some(access_key), Some(secret_key)) = (access_key, secret_key) else {
         return Err(TestErr {
             kind: TestErrKind::NoCredentials,
-            detail: "No credentials — enter the access and secret key, or Save first"
-                .into(),
+            detail: "No credentials — enter the access and secret key".into(),
             code: None,
             http_status: None,
         });
@@ -120,4 +138,34 @@ pub async fn test_connection(
         ms: started.elapsed().as_millis() as u64,
         bucket,
     })
+}
+
+/// True when the keys stored for a connection may fill the form's blank key
+/// fields: only for that saved connection, and only while the form still points
+/// at the endpoint they were saved for.
+fn may_use_stored_keys(saved_endpoint: Option<&str>, form_endpoint: &str) -> bool {
+    saved_endpoint.is_some_and(|saved| same_endpoint(saved, form_endpoint))
+}
+
+/// Two spellings of one endpoint: case, surrounding spaces and a trailing `/`
+/// do not change where a request goes.
+pub(crate) fn same_endpoint(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches('/').to_ascii_lowercase();
+    norm(a) == norm(b)
+}
+
+#[cfg(test)]
+mod stored_key_tests {
+    use super::may_use_stored_keys;
+
+    #[test]
+    fn stored_keys_go_only_to_the_endpoint_they_were_saved_for() {
+        let saved = "https://s3api-eu-ro-1.runpod.io";
+        assert!(may_use_stored_keys(Some(saved), saved));
+        assert!(may_use_stored_keys(Some(saved), "https://s3api-eu-ro-1.runpod.io/ "));
+        // A draft has no saved keys of its own; another connection's are not borrowed.
+        assert!(!may_use_stored_keys(None, saved));
+        // A saved connection whose endpoint was changed in the form.
+        assert!(!may_use_stored_keys(Some(saved), "https://attacker.example"));
+    }
 }

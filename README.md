@@ -1,6 +1,6 @@
 # BG Bucket Browser
 
-Version 1.1.1
+Version 1.2.0
 
 Created by Bulent Gercek
 
@@ -62,7 +62,9 @@ application replaces both with a direct, always-available file manager.
   captures a detailed log for up to five minutes while you reproduce an issue;
   it is attached in its own read-only box, so you see exactly what will be
   sent. A recording cut short by a crash is offered again on the next start.
-- Light, dark, and system theme.
+- Light, dark, and system theme, and four font sizes. Outside the panels,
+  Ctrl + / - and Ctrl + mouse wheel step through them (Cmd on macOS); inside a
+  panel they change its row and tile size.
 
 ## Non-goals
 
@@ -101,6 +103,13 @@ else works the same way on all three.
 
 Prebuilt packages are published with each release on the
 [Releases](https://github.com/bulentgercek/bg-bucket-browser/releases) page.
+
+The packages are not signed, so check a download before you open it: its
+SHA-256 must match the one listed in the release notes. Only then continue
+past the warnings described below.
+
+- Windows, in PowerShell: `Get-FileHash <file>`
+- macOS, in Terminal: `shasum -a 256 <file>`
 
 **Linux:** no prebuilt package. A build made on your own system links against
 its own libraries, so it runs there without compatibility issues — see
@@ -231,8 +240,9 @@ open with a `=== session ... ===` line and close with `=== session end ... ===`
 when the application exits normally, so a missing end line means it was killed
 or crashed.
 
-`verbose.log` is off in a build made from a release checkout and on in a
-development one. `BGBB_LOG=verbose` turns it on, `BGBB_LOG=quiet` turns it off.
+`verbose.log` is off by default; `BGBB_LOG=verbose` turns it on and
+`BGBB_LOG=quiet` turns it off. Only builds from the developer's own working
+copy, which holds files that are not published here, have it on by default.
 Neither file is configurable from the interface, neither is sent anywhere, and
 credentials are never written to either.
 
@@ -242,9 +252,10 @@ It contains file names and paths, but no credentials. It leaves your computer
 only when you press **Send**: the report goes over HTTPS to
 `https://bulentgercek.com/feedback`, which forwards it to the developer by
 email and deletes its copy 30 days after delivery. The file is deleted once the report is
-accepted, or when you remove the recording. A build made from a development
-checkout sends to the service's test channel, where nothing is stored or
-delivered.
+accepted, or when you remove the recording. A report sent from any build of
+this repository, including one started with `npx tauri dev`, reaches the
+developer this way. Only builds from the developer's own working copy send to
+the service's test channel, where nothing is stored or delivered.
 
 ## Architecture
 

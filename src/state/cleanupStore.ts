@@ -101,10 +101,20 @@ export const useCleanupStore = create<CleanupState>((set, get) => ({
   runDelete: async () => {
     const keys = [...get().selected];
     if (keys.length === 0) return;
+    // Each pick goes with the version the scan saw it in.
+    const report = get().report;
+    const etags = new Map(
+      [...(report?.largest ?? []), ...(report?.reclaimable ?? [])].map((e) => [e.key, e.etag]),
+    );
     set({ status: "deleting" });
     try {
-      const n = await deleteScanned(keys);
-      useToastStore.getState().push(t("cleanup.deleted", { count: n }));
+      const { deleted, changed, failed } = await deleteScanned(
+        keys.map((key) => ({ key, etag: etags.get(key) ?? "" })),
+      );
+      const parts = [t("cleanup.deleted", { count: deleted })];
+      if (changed > 0) parts.push(t("cleanup.keptChanged", { count: changed }));
+      if (failed > 0) parts.push(t("cleanup.deleteFailed", { count: failed }));
+      useToastStore.getState().push(parts.join(" "), failed > 0 ? "error" : undefined);
     } catch (e) {
       useToastStore.getState().push(String(e), "error");
     }
