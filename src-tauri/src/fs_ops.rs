@@ -170,7 +170,12 @@ async fn copy_then_delete(
         .send()
         .await
     {
-        Ok(_) => {}
+        Ok(o) => {
+            let written = o.copy_object_result().and_then(|r| r.e_tag());
+            crate::core::verify_written(client, bucket, new_key, size, written)
+                .await
+                .map_err(|e| FsErr::new(FsErrKind::S3, e))?;
+        }
         Err(e) if precondition_failed(&e) => {
             return Err(FsErr::new(
                 FsErrKind::S3,
@@ -179,9 +184,6 @@ async fn copy_then_delete(
         }
         Err(e) => return Err(FsErr::new(FsErrKind::S3, s3_detail(&e))),
     }
-    crate::core::verify_object_size(client, bucket, new_key, size)
-        .await
-        .map_err(|e| FsErr::new(FsErrKind::S3, e))?;
     match client
         .delete_object()
         .bucket(bucket)

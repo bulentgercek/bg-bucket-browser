@@ -17,10 +17,10 @@
 //! Verbose is on by default in development builds and off otherwise.
 //! `BGBB_LOG=verbose` turns it on, `BGBB_LOG=quiet` turns it off.
 //!
-//! A third file, `recording.log`, exists only while the user records a problem
+//! A third file, `feedback.log`, exists only while the user logs a problem
 //! for a feedback report (Settings → Feedback). For that time every verbose
 //! line is written there too, whatever the verbose setting is. It opens with
-//! `=== recording start ... ===` and closes with `=== recording end ... ===`;
+//! `=== log start ... ===` and closes with `=== log end ... ===`;
 //! a missing end means the app went down while recording. It stays until the
 //! report is sent or discarded.
 //!
@@ -41,7 +41,15 @@ const VERBOSE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 // A recording stops by itself after this long, or past this size.
 pub const RECORDING_MAX_SECS: u64 = 5 * 60;
 const RECORDING_MAX_BYTES: u64 = 16 * 1024 * 1024;
-const RECORDING_FILE: &str = "recording.log";
+// The user reads this file before sending it, and its folder is documented:
+// the name and the markers say "log", the word the interface uses.
+const RECORDING_FILE: &str = "feedback.log";
+/// The first words of the line that opens a recording.
+pub const RECORDING_START: &str = "=== log start ";
+/// The first words of the line that closes a recording.
+pub const RECORDING_END: &str = "=== log end ";
+// The file's name up to 1.2.0.
+const LEGACY_RECORDING_FILE: &str = "recording.log";
 
 // Checked on every verbose call without taking the lock.
 static VERBOSE_ON: AtomicBool = AtomicBool::new(false);
@@ -137,7 +145,49 @@ fn now_full() -> String {
 }
 
 fn one_line(text: &str) -> String {
-    text.replace("\r\n", " | ").replace(['\n', '\r'], " | ")
+    scrub(&text.replace("\r\n", " | ").replace(['\n', '\r'], " | "))
+}
+
+/// What a credential is introduced by in a signature header, a signed URL or
+/// an S3 error body; the word after one of these is never written.
+const KEY_MARKERS: &[&str] = &[
+    "Credential=",
+    "Signature=",
+    "<AWSAccessKeyId>",
+    "AWSAccessKeyId=",
+];
+
+/// Takes what looks like a credential out of a line before it is written: the
+/// word after a marker above, and any word shaped like an access key.
+///
+/// The app never logs a key itself. This is for text it does not write: an
+/// error message is the server's, and a server may repeat back what it was
+/// sent.
+fn scrub(text: &str) -> String {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(word) {
+        let (before, from) = rest.split_at(start);
+        let end = from.find(|c| !word(c)).unwrap_or(from.len());
+        let (run, after) = from.split_at(end);
+        out.push_str(before);
+        let marked = KEY_MARKERS.iter().any(|m| out.ends_with(m));
+        out.push_str(if marked || key_shaped(run) { "***" } else { run });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// True for a word shaped like an access key: an AWS key id, or one of
+/// RunPod's prefixed keys.
+fn key_shaped(word: &str) -> bool {
+    let alnum = |s: &str, min: usize| s.len() >= min && s.bytes().all(|b| b.is_ascii_alphanumeric());
+    if let Some(tail) = word.strip_prefix("AKIA").or_else(|| word.strip_prefix("ASIA")) {
+        return tail.len() == 16 && tail.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    }
+    ["rps_", "rpa_", "user_"].iter().any(|p| word.strip_prefix(p).is_some_and(|tail| alnum(tail, 20)))
 }
 
 fn channel_default() -> bool {
@@ -163,6 +213,7 @@ fn init_in(dir: &Path, verbose: bool) {
     if fs::create_dir_all(dir).is_err() {
         return;
     }
+    adopt_legacy_recording(dir);
     // toast.log holds only the current session; the previous one becomes `.1`.
     let toast_path = dir.join("toast.log");
     if toast_path.exists() {
@@ -242,7 +293,7 @@ fn recording_path(l: &Logger) -> PathBuf {
 fn end_recording(l: &mut Logger) {
     if let Some((mut r, _)) = l.recording.take() {
         r.flush_repeats();
-        r.raw(&format!("=== recording end {} ===\n", now_full()));
+        r.raw(&format!("{RECORDING_END}{} ===\n", now_full()));
     }
     RECORDING_ON.store(false, Ordering::Relaxed);
 }
@@ -250,26 +301,41 @@ fn end_recording(l: &mut Logger) {
 /// Starts a feedback recording, replacing any earlier one that was not sent.
 pub fn recording_start() -> Result<(), String> {
     let mut result = Err("the log is not available".to_string());
-    with_logger(|l| {
-        end_recording(l);
-        let path = recording_path(l);
-        let _ = fs::remove_file(&path);
-        let mut sink = Sink::open(path);
-        if sink.file.is_none() {
-            result = Err("could not open the recording file".into());
-            return;
-        }
-        sink.raw(&format!(
-            "=== recording start {} v{} {} ===\n",
-            now_full(),
-            env!("CARGO_PKG_VERSION"),
-            std::env::consts::OS,
-        ));
-        l.recording = Some((sink, std::time::Instant::now()));
-        RECORDING_ON.store(true, Ordering::Relaxed);
-        result = Ok(());
-    });
+    with_logger(|l| result = start_recording(l));
     result
+}
+
+fn start_recording(l: &mut Logger) -> Result<(), String> {
+    end_recording(l);
+    let path = recording_path(l);
+    let _ = fs::remove_file(&path);
+    let mut sink = Sink::open(path);
+    if sink.file.is_none() {
+        return Err("could not open the feedback log".into());
+    }
+    sink.raw(&format!(
+        "{RECORDING_START}{} v{} {} ===\n",
+        now_full(),
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+    ));
+    l.recording = Some((sink, std::time::Instant::now()));
+    RECORDING_ON.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Takes over a recording left on disk under the name the file had up to
+/// 1.2.0, so it is still offered for sending and still goes away with its
+/// report. Where a recording already exists under today's name, or the old
+/// name is not a plain file, the old one is only removed.
+fn adopt_legacy_recording(dir: &Path) {
+    let old = dir.join(LEGACY_RECORDING_FILE);
+    let Ok(meta) = fs::symlink_metadata(&old) else { return };
+    let new = dir.join(RECORDING_FILE);
+    let free = fs::symlink_metadata(&new).is_err();
+    if !(meta.is_file() && free && fs::rename(&old, &new).is_ok()) {
+        let _ = fs::remove_file(&old);
+    }
 }
 
 /// Ends the running recording, if any. The file stays until it is sent or discarded.
@@ -393,7 +459,111 @@ mod tests {
     }
 
     #[test]
+    fn what_looks_like_a_credential_is_not_written() {
+        let line = "InvalidAccessKeyId: <AWSAccessKeyId>myKey123</AWSAccessKeyId> not found";
+        assert_eq!(scrub(line), "InvalidAccessKeyId: <AWSAccessKeyId>***</AWSAccessKeyId> not found");
+        let line = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261002/eu-ro-1/s3/aws4_request, SignedHeaders=host, Signature=0123abcd";
+        assert_eq!(
+            scrub(line),
+            "AWS4-HMAC-SHA256 Credential=***/20261002/eu-ro-1/s3/aws4_request, SignedHeaders=host, Signature=***"
+        );
+        assert_eq!(scrub("key AKIAIOSFODNN7EXAMPLE was refused"), "key *** was refused");
+        assert_eq!(scrub("token rps_ABCDEFGHIJKLMNOPQRSTUVWX1234 echoed"), "token *** echoed");
+        assert_eq!(scrub("user_2aBcDeFgHiJkLmNoPqRsTuVw and rpa_ABCDEFGHIJ0123456789XYZ"), "*** and ***");
+    }
+
+    #[test]
+    fn ordinary_names_are_left_alone() {
+        for line in [
+            "list models/user_presets/rps_notes.txt",
+            "[cmd] ← list_remote ok 203ms",
+            "user_data.json and AKIA.txt",
+            "upload 0123456789abcdef0123456789abcdef.safetensors",
+        ] {
+            assert_eq!(scrub(line), line);
+        }
+    }
+
+    #[test]
     fn one_line_joins_newlines() {
         assert_eq!(one_line("a\nb\r\nc"), "a | b | c");
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bgbb-devlog-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The file the user reads before sending calls itself a log, in its name
+    /// and in the lines that open and close it.
+    #[test]
+    fn a_feedback_log_is_named_and_marked_as_a_log() {
+        let dir = temp_dir("marks");
+        let mut l = Logger {
+            dir: dir.clone(),
+            toast: Sink::open(dir.join("toast.log")),
+            verbose: None,
+            recording: None,
+        };
+        start_recording(&mut l).unwrap();
+        write_verbose(&mut l, "cmd", "→ list_local");
+        end_recording(&mut l);
+        let text = fs::read_to_string(dir.join("feedback.log"));
+        fs::remove_dir_all(&dir).unwrap();
+        let text = text.expect("the log is written to feedback.log");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].starts_with("=== log start "), "{text}");
+        assert!(lines[2].starts_with("=== log end "), "{text}");
+        assert!(!text.to_lowercase().contains("record"), "{text}");
+    }
+
+    /// A log left by a version that named the file `recording.log` is taken
+    /// over, so it is offered again and goes away with its report.
+    #[test]
+    fn a_log_under_the_old_name_is_taken_over() {
+        let dir = temp_dir("legacy");
+        fs::write(dir.join("recording.log"), "old\n").unwrap();
+        adopt_legacy_recording(&dir);
+        let old_left = dir.join("recording.log").exists();
+        let taken = fs::read_to_string(dir.join("feedback.log")).ok();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!old_left, "nothing stays under the old name");
+        assert_eq!(taken.as_deref(), Some("old\n"));
+    }
+
+    /// With a log under both names the newer one stays as it is.
+    #[test]
+    fn a_newer_log_wins_over_one_under_the_old_name() {
+        let dir = temp_dir("legacy-both");
+        fs::write(dir.join("recording.log"), "old\n").unwrap();
+        fs::write(dir.join("feedback.log"), "new\n").unwrap();
+        adopt_legacy_recording(&dir);
+        let old_left = dir.join("recording.log").exists();
+        let kept = fs::read_to_string(dir.join("feedback.log")).ok();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!old_left, "nothing stays under the old name");
+        assert_eq!(kept.as_deref(), Some("new\n"));
+    }
+
+    /// A link under the old name is removed, never followed: its target is
+    /// neither taken over as a log nor deleted.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_under_the_old_name_is_removed_not_followed() {
+        let dir = temp_dir("legacy-link");
+        let target = dir.join("elsewhere.txt");
+        fs::write(&target, "private\n").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("recording.log")).unwrap();
+        adopt_legacy_recording(&dir);
+        let link_left = fs::symlink_metadata(dir.join("recording.log")).is_ok();
+        let taken = fs::symlink_metadata(dir.join("feedback.log")).is_ok();
+        let target_text = fs::read_to_string(&target).ok();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!link_left, "the link itself goes");
+        assert!(!taken, "a link is not taken over as a log");
+        assert_eq!(target_text.as_deref(), Some("private\n"), "its target is untouched");
     }
 }

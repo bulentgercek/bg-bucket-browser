@@ -48,6 +48,10 @@ export const en = {
   // Drag and drop
   "dnd.file": "file",
   "dnd.files": "files",
+  "dnd.folder": "folder",
+  "dnd.folders": "folders",
+  "dnd.item": "item",
+  "dnd.items": "items",
   "dnd.moveHere": "Move Here",
   "dnd.copyHere": "Copy Here",
   "dnd.cancel": "Cancel",
@@ -256,6 +260,13 @@ export const en = {
     "Not saved: a new endpoint needs the access key and the secret key again",
   "settings.connections.busy":
     "This connection has transfers waiting or running. Change its endpoint or bucket once they finish, or cancel them first.",
+  "settings.connections.busyKeys":
+    "This connection has transfers waiting or running. Remove its keys once they finish, or cancel them first.",
+  "settings.connections.removeKeys": "Remove keys",
+  "settings.connections.removeKeysTitle": "Remove keys?",
+  "settings.connections.removeKeysBody":
+    "Remove the access key and the secret key of {name} from the OS keychain? The connection stays, and needs both keys again before it can be used.",
+  "settings.connections.keysRemoved": "Keys removed from the OS keychain",
   "settings.connections.delete": "Delete connection",
   "settings.connections.discard": "Discard",
   "settings.connections.deleteTitle": "Delete connection?",
@@ -293,7 +304,7 @@ export const en = {
   "settings.runpod.remove": "Remove",
   "dialog.cleanUpTitle": "Clean up interrupted uploads?",
   "dialog.cleanUpBody":
-    "{count} unfinished upload(s) ({size}) will be aborted on the network volume. Any that you plan to resume will have to start over. This can't be undone.",
+    "{count} unfinished upload(s) ({size}) will be aborted on the network volume, including any started from another program or another computer. Any that you plan to resume will have to start over. This can't be undone.",
 
   "dialog.switchConnTitle": "Switch connection?",
   "dialog.switchConnBody":
@@ -388,12 +399,12 @@ export const en = {
   "feedback.message.placeholder": "What happened, and what did you expect?",
   "feedback.contact.label": "Your email (optional)",
   "feedback.contact.hint": "Only used to reply to you.",
-  "feedback.record": "Record the problem",
+  "feedback.record": "Log the problem",
   "feedback.record.howto":
     "Settings closes. Do what caused the problem, then press Stop & send at the bottom of the window. Up to 5 minutes.",
   "feedback.record.warning":
-    "While recording, the app writes a detailed log, including file names and paths. It is sent with your message.",
-  "feedback.recording.title": "Recording · attached automatically",
+    "While logging, the app writes a detailed log, including file names and paths. It is sent with your message.",
+  "feedback.recording.title": "Log · attached automatically",
   "feedback.recording.meta": "{duration} · {lines} lines",
   "feedback.recording.cutShort": "Cut short when the app closed unexpectedly",
   "feedback.recording.remove": "Remove",
@@ -411,13 +422,13 @@ export const en = {
     "The feedback service had a problem. Please try again later; your message is kept.",
   "feedback.err.network":
     "Couldn't reach the feedback service. Check your connection; your message is kept.",
-  "feedback.err.record": "Couldn't start recording",
-  "feedback.pill": "REC {elapsed} / {max}",
+  "feedback.err.record": "Couldn't start logging",
+  "feedback.pill": "Logging {elapsed} / {max}",
   "feedback.pill.stop": "Stop & send",
-  "feedback.recovered.title": "Unsent recording",
+  "feedback.recovered.title": "Unsent log",
   "feedback.recovered.bodyCut":
-    "Your last recording was cut short when the app closed unexpectedly. Send it?",
-  "feedback.recovered.body": "You have a recording that was not sent yet. Send it?",
+    "Your last log was cut short when the app closed unexpectedly. Send it?",
+  "feedback.recovered.body": "You have a log that was not sent yet. Send it?",
   "feedback.recovered.confirm": "Review and send",
   "feedback.recovered.discard": "Discard",
 } as const;

@@ -73,6 +73,7 @@ import { ViewControl } from "./ViewControl";
 import { PropertiesContent } from "./PropertiesContent";
 import { usePaneKeyboard } from "./usePaneKeyboard";
 import { usePaneDnd } from "./usePaneDnd";
+import { SELECTION } from "./selectionColors";
 
 /* One pane: its tabs, the path and filter above the list, the list itself, and
    everything that can be done to what is in it.
@@ -136,6 +137,7 @@ export default function Panel({ index }: { index: PaneIndex }) {
   const bucket = useConnectionStore((s) => s.bucket);
   const homeDir = useDeviceStore((s) => s.homeDir);
   const connCount = useConnectionStore((s) => s.connections.length);
+  const connLoaded = useConnectionStore((s) => s.loaded);
   const activeConn = useConnectionStore(
     (s) => s.connections.find((c) => c.id === s.activeId) ?? s.connections[0] ?? null,
   );
@@ -167,7 +169,9 @@ export default function Panel({ index }: { index: PaneIndex }) {
 
   // What the pane shows instead of a list, and what can be done from there.
   const stateOpts = {
-    noConnection: remote && connCount === 0,
+    // Until the list has arrived a count of zero says nothing: the invitation
+    // waits for an answer that is really empty.
+    noConnection: remote && connLoaded && connCount === 0,
     // A connection that exists but cannot possibly work. The test has to match
     // the backend's own idea of usable — keys and endpoint and region and
     // bucket — or a half-filled connection reaches the list and draws a path
@@ -874,7 +878,11 @@ export default function Panel({ index }: { index: PaneIndex }) {
           }), transparent 55%)`,
         }}
       />
-      {stateOpts.noConnection ? (
+      {remote && !connLoaded ? (
+        // The connection list is still on its way: neither the invitation nor
+        // tabs built on a bucket that is not known yet.
+        <div className="flex-1 min-h-0" />
+      ) : stateOpts.noConnection ? (
         // With no connection at all, tabs and a path mean nothing: the whole
         // pane becomes one invitation to set one up.
         <div className="flex flex-1 min-h-0 flex-col items-center justify-center gap-3 px-6 text-center">
@@ -999,7 +1007,7 @@ export default function Panel({ index }: { index: PaneIndex }) {
         className={
           "flex min-h-0 flex-1 flex-col overflow-y-auto rounded-sm outline outline-2 -outline-offset-2 outline-dashed transition-[outline-color] duration-150 " +
           (showBodyFrame || osBodyFrame
-            ? "outline-accent-400"
+            ? SELECTION[pane.side].dropOutline
             : "outline-transparent")
         }
       >

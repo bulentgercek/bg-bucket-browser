@@ -157,6 +157,20 @@ export function usePaneKeyboard({
 
       const st = usePaneStore.getState().panes[index];
       const cur = st.tabs.find((tb) => tb.id === st.activeTabId);
+      // Backspace is the way back out of a folder that is slow to load or
+      // failed to; every other key waits for a list to act on.
+      if (
+        cur &&
+        e.key === "Backspace" &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        (cur.status === "loading" || cur.status === "error")
+      ) {
+        e.preventDefault();
+        const panes = usePaneStore.getState();
+        void (cur.status === "loading" ? panes.backOutOfLoad(index) : panes.goParent(index));
+        return;
+      }
       if (!cur || cur.status !== "ready") return;
 
       // A tile the mouse clicked keeps the focus; moving with the keys would

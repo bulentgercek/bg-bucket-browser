@@ -49,14 +49,29 @@ impl FeedbackErr {
     }
 }
 
+// The markers written up to 1.2.0: a recording left on disk by that version
+// is read like one written today.
+const OLD_START: &str = "=== recording start ";
+const OLD_END: &str = "=== recording end ";
+
+fn is_start(line: &str) -> bool {
+    line.starts_with(devlog::RECORDING_START) || line.starts_with(OLD_START)
+}
+
+fn is_end(line: &str) -> bool {
+    line.starts_with(devlog::RECORDING_END) || line.starts_with(OLD_END)
+}
+
 fn is_marker(line: &str) -> bool {
-    line.starts_with("=== recording ")
+    is_start(line) || is_end(line)
 }
 
 /// The time a log line starts with, `YYYY-MM-DD HH:MM:SS.mmm`.
 fn stamp_of(line: &str) -> Option<chrono::NaiveDateTime> {
-    let body = line.strip_prefix("=== recording start ").unwrap_or(line);
-    let body = body.strip_prefix("=== recording end ").unwrap_or(body);
+    let body = [devlog::RECORDING_START, devlog::RECORDING_END, OLD_START, OLD_END]
+        .iter()
+        .find_map(|mark| line.strip_prefix(mark))
+        .unwrap_or(line);
     let s = body.get(..23)?;
     chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.3f").ok()
 }
@@ -69,7 +84,7 @@ fn describe(text: String, active: bool) -> RecordingInfo {
         (Some(a), Some(b)) => (b - a).num_seconds().max(0) as u64,
         _ => 0,
     };
-    let cut_short = !active && !text.lines().any(|l| l.starts_with("=== recording end "));
+    let cut_short = !active && !text.lines().any(is_end);
     RecordingInfo { text, lines, duration_sec, active, cut_short }
 }
 
@@ -143,14 +158,14 @@ fn os_version() -> String {
 #[tauri::command]
 pub fn feedback_record_start() -> Result<(), String> {
     devlog::recording_start()?;
-    devlog::verbose("feedback", "recording started");
+    devlog::verbose("feedback", "log started");
     Ok(())
 }
 
 /// Stops the recording and returns it.
 #[tauri::command]
 pub fn feedback_record_stop() -> Option<RecordingInfo> {
-    devlog::verbose("feedback", "recording stopped");
+    devlog::verbose("feedback", "log stopped");
     devlog::recording_stop();
     devlog::recording_text().map(|t| describe(t, false))
 }
@@ -253,7 +268,7 @@ pub async fn feedback_send(
 mod tests {
     use super::*;
 
-    const START: &str = "=== recording start 2026-09-25 10:00:00.000 v1.1.0 linux ===";
+    const START: &str = "=== log start 2026-09-25 10:00:00.000 v1.1.0 linux ===";
 
     #[test]
     fn an_answer_id_is_short_and_plain() {
@@ -289,7 +304,7 @@ mod tests {
     #[test]
     fn duration_and_cut_short() {
         let done = format!(
-            "{START}\n2026-09-25 10:01:00.000 [cmd] a\n=== recording end 2026-09-25 10:03:30.000 ===\n"
+            "{START}\n2026-09-25 10:01:00.000 [cmd] a\n=== log end 2026-09-25 10:03:30.000 ===\n"
         );
         let info = describe(done, false);
         assert_eq!(info.duration_sec, 210);
@@ -303,6 +318,24 @@ mod tests {
 
         let running = format!("{START}\n2026-09-25 10:00:40.000 [cmd] a\n");
         assert!(!describe(running, true).cut_short, "a running recording is not cut short");
+    }
+
+    /// A log left on disk by a version that wrote the older markers reads the same.
+    #[test]
+    fn a_log_with_the_older_markers_is_still_read() {
+        const OLD: &str = "=== recording start 2026-09-25 10:00:00.000 v1.2.0 linux ===";
+        let done = format!(
+            "{OLD}\n2026-09-25 10:01:00.000 [cmd] a\n=== recording end 2026-09-25 10:03:30.000 ===\n"
+        );
+        let info = describe(done, false);
+        assert_eq!(info.duration_sec, 210);
+        assert_eq!(info.lines, 1);
+        assert!(!info.cut_short);
+
+        let crashed = format!("{OLD}\n2026-09-25 10:00:40.000 [cmd] a\n");
+        let info = describe(crashed, false);
+        assert_eq!(info.duration_sec, 40);
+        assert!(info.cut_short);
     }
 
     #[test]

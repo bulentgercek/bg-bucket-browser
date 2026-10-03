@@ -216,6 +216,11 @@ export default function Sidebar() {
   const removePin = usePinStore((s) => s.removePin);
   const movePin = usePinStore((s) => s.movePin);
   const devices = useDeviceStore((s) => s.devices);
+  // The sections are shown together, once both lists have answered: shown as
+  // each arrives, every new section pushes the ones below it down.
+  const devicesLoaded = useDeviceStore((s) => s.loaded);
+  const connectionsLoaded = useConnectionStore((s) => s.loaded);
+  const sectionsReady = devicesLoaded && connectionsLoaded;
   const recent = useRecentStore((s) => s.items);
   const connections = useConnectionStore((s) => s.connections);
   const activeConnId = useConnectionStore((s) => s.activeId);
@@ -490,7 +495,10 @@ export default function Sidebar() {
         if (useContextMenu.getState().open) return;
         setActivePane(null);
       }}
-      className="flex min-h-0 flex-col gap-[14px] overflow-y-auto border-r border-neutral-900 bg-chrome px-2.5 py-3 focus:outline-none"
+      className={
+        "flex min-h-0 flex-col gap-[14px] overflow-y-auto border-r border-neutral-900 bg-chrome px-2.5 py-3 focus:outline-none" +
+        (sectionsReady ? "" : " [&>*]:invisible")
+      }
     >
       {connections.length > 0 && (
         <Section title={t("main.sidebar.networkVolumes")}>

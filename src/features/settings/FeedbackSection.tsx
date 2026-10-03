@@ -1,4 +1,4 @@
-import { RecordIcon, XIcon } from "@phosphor-icons/react";
+import { ScrollIcon, XIcon } from "@phosphor-icons/react";
 import { useFeedbackStore } from "../../state/feedbackStore";
 import { t } from "../../locale/en";
 
@@ -97,9 +97,10 @@ export default function FeedbackSection() {
             type="button"
             disabled={recording}
             onClick={() => void startRecording()}
-            className="btn border-[var(--color-danger)] text-[13px] text-[var(--color-danger)] hover:bg-[color-mix(in_srgb,var(--color-danger)_12%,transparent)]"
+            className="btn border-neutral-800 text-[13px] hover:border-accent-700 hover:text-accent-300"
           >
-            <RecordIcon size={14} weight="fill" />
+            {/* Drawn like the status bar's pills, not as a record button: what starts here is a text log. */}
+            <ScrollIcon size={14} className="shrink-0 text-accent-400" />
             {t("feedback.record")}
           </button>
           <p className="max-w-[520px] text-[11.5px] text-neutral-500">

@@ -1,3 +1,4 @@
+import { ScrollIcon } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { RECORDING_MAX_SEC, useFeedbackStore } from "../../state/feedbackStore";
 import { t } from "../../locale/en";
@@ -38,9 +39,10 @@ export default function RecordingIndicator() {
     <button
       type="button"
       onClick={() => void stop()}
-      className="flex items-center gap-1.5 rounded-full border border-[var(--color-danger)] px-2 py-0.5 text-[var(--color-danger)] hover:bg-[color-mix(in_srgb,var(--color-danger)_12%,transparent)]"
+      className="flex items-center gap-1.5 rounded-full border border-accent-700 px-2 py-0.5 text-accent-300 hover:bg-[color-mix(in_srgb,var(--color-accent)_12%,transparent)]"
     >
-      <span className="h-[7px] w-[7px] shrink-0 animate-pulse rounded-full bg-[var(--color-danger)]" />
+      {/* The accent, and the button's own icon: the pill stands out among its neighbours without looking like an alarm. */}
+      <ScrollIcon size={11} className="shrink-0 text-accent-400" />
       <span className="tabular-nums">
         {t("feedback.pill", {
           elapsed: mmss(Math.min(elapsed, RECORDING_MAX_SEC)),

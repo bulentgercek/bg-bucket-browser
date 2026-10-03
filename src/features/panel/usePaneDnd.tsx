@@ -171,7 +171,7 @@ export function usePaneDnd({
           entry.modified,
         );
         const th = useThumbStore.getState().map[k];
-        iconsDragImage(e, th?.status === "ready" ? th.uri : undefined);
+        iconsDragImage(e, th?.status === "ready" ? th.uri : undefined, pane.side);
       }
       e.dataTransfer.setData(
         "text/plain",

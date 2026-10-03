@@ -1,7 +1,7 @@
 import { type PaneSide } from "../../state/paneStore";
 
-/* The selection and the keyboard cursor in a pane's list, in the colour of the
-   pane's side, like its frame and its folders. The two palettes run the same
+/* The selection, the keyboard cursor and the marks of a drag in a pane's list,
+   in the colour of the pane's side, like its frame and its folders. The two palettes run the same
    scale in both themes, so a shade reads the same on either side. The class
    names are written out in full: Tailwind finds them by reading the source. */
 export interface SelectionColors {
@@ -25,6 +25,12 @@ export interface SelectionColors {
   tileLabel: string;
   /** A selected tile's icon, when it has no picture. */
   tileIcon: string;
+  /** A folder a drag is over: its wash and its dashed outline. The pane's own
+      dashed frame takes the same outline. */
+  dropFill: string;
+  dropOutline: string;
+  /** The edge of the thumbnail that follows the pointer, as a CSS colour. */
+  dragChipBorder: string;
 }
 
 export const SELECTION: Record<PaneSide, SelectionColors> = {
@@ -40,6 +46,9 @@ export const SELECTION: Record<PaneSide, SelectionColors> = {
     tileTint: "bg-accent-500",
     tileLabel: "bg-accent-800",
     tileIcon: "text-accent-400",
+    dropFill: "bg-[color-mix(in_srgb,var(--color-accent)_14%,transparent)]",
+    dropOutline: "outline-accent-400",
+    dragChipBorder: "var(--color-accent-600)",
   },
   local: {
     fill: "bg-local-900",
@@ -53,5 +62,8 @@ export const SELECTION: Record<PaneSide, SelectionColors> = {
     tileTint: "bg-local-500",
     tileLabel: "bg-local-800",
     tileIcon: "text-local-400",
+    dropFill: "bg-[color-mix(in_srgb,var(--color-local)_14%,transparent)]",
+    dropOutline: "outline-local-400",
+    dragChipBorder: "var(--color-local-600)",
   },
 };

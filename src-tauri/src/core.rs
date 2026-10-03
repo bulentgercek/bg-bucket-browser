@@ -385,9 +385,10 @@ pub const DIR_MAX_ENTRIES: u64 = 1_000_000;
 pub const TREE_MAX_ENTRIES: u64 = 5_000_000;
 
 /// Guards a listing that follows continuation tokens. A token that comes round
-/// again means the server is going in circles, and too many entries means a
-/// listing nothing can use; either ends the listing with an error instead of
-/// letting it run on or fill memory.
+/// again means the server is going in circles, too many entries means a
+/// listing nothing can use, and page after page with nothing in it means a
+/// listing that is not getting anywhere; each ends the listing with an error
+/// instead of letting it run on or fill memory.
 ///
 /// The SDK's paginator catches only a token repeated twice in a row.
 pub struct PageGuard {
@@ -398,11 +399,18 @@ pub struct PageGuard {
     last: Option<u64>,
     items: u64,
     max_items: u64,
+    /// Pages in a row that carried no entry.
+    empty_run: u32,
 }
+
+/// Pages in a row a listing may get with nothing in them. A server may answer
+/// with an empty page and a token while it passes over entries it does not
+/// return, so a run of them is normal; one this long is not.
+const MAX_EMPTY_PAGES: u32 = 10_000;
 
 impl PageGuard {
     pub fn new(max_items: u64) -> Self {
-        PageGuard { seen: Default::default(), last: None, items: 0, max_items }
+        PageGuard { seen: Default::default(), last: None, items: 0, max_items, empty_run: 0 }
     }
 
     /// Counts a page just read: its entries and the token it points on with.
@@ -411,6 +419,10 @@ impl PageGuard {
         self.items += items as u64;
         if self.items > self.max_items {
             return Err(PageStop::TooMany(self.max_items));
+        }
+        self.empty_run = if items == 0 { self.empty_run + 1 } else { 0 };
+        if self.empty_run > MAX_EMPTY_PAGES {
+            return Err(PageStop::Empty(MAX_EMPTY_PAGES));
         }
         if let Some(token) = next.filter(|t| !t.is_empty()) {
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -432,6 +444,8 @@ pub enum PageStop {
     TooMany(u64),
     /// A page token came round again.
     Loop,
+    /// More pages in a row with nothing in them than a listing gets.
+    Empty(u32),
 }
 
 impl std::fmt::Display for PageStop {
@@ -439,6 +453,7 @@ impl std::fmt::Display for PageStop {
         match self {
             PageStop::TooMany(max) => write!(f, "the listing has more than {max} entries"),
             PageStop::Loop => f.write_str("the server sent a page token it had sent before"),
+            PageStop::Empty(max) => write!(f, "the server sent more than {max} empty pages in a row"),
         }
     }
 }
@@ -470,48 +485,66 @@ where
     }
 }
 
-/// Asks the gateway how large the object actually is.
-async fn stored_object_size(client: &Client, bucket: &str, key: &str) -> Result<Option<i64>, String> {
+/// Asks the gateway what is stored at the key now: its size and its ETag.
+async fn stored_object(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<(Option<i64>, Option<String>), String> {
     client
         .head_object()
         .bucket(bucket)
         .key(key)
         .send()
         .await
-        .map(|h| h.content_length())
+        .map(|h| (h.content_length(), h.e_tag().filter(|e| !e.is_empty()).map(str::to_string)))
         .map_err(|e| format!("HEAD {key}: {}", s3_err(&e)))
 }
 
-/// Checks a finished write and deletes the object if its stored size differs
-/// from the source.
+/// Checks a finished write: the object at the key must be the one this write
+/// made, at the size of its source. `written` is the ETag the write call
+/// returned.
 ///
-/// A wrong object is worse than no object: the next listing would show it as a
-/// complete file.
-pub async fn verify_object_size(
+/// An object of ours with the wrong size is deleted, as that version only: a
+/// wrong object is worse than no object, since the next listing would show it
+/// as a complete file. An object somebody else wrote to the same key meanwhile
+/// is neither accepted as ours nor deleted.
+pub async fn verify_written(
     client: &Client,
     bucket: &str,
     key: &str,
     expected: u64,
+    written: Option<&str>,
 ) -> Result<(), String> {
-    let got = stored_object_size(client, bucket, key).await?;
-    if got == Some(expected as i64) {
+    let (size, etag) = stored_object(client, bucket, key).await?;
+    let same = |a: &str, b: &str| a.trim_matches('"') == b.trim_matches('"');
+    if let (Some(written), Some(now)) = (written.filter(|w| !w.is_empty()), etag.as_deref())
+        && !same(written, now)
+    {
+        return Err(format!(
+            "{key}: another writer replaced it on the volume before it could be checked"
+        ));
+    }
+    if size == Some(expected as i64) {
         return Ok(());
     }
-    let _ = client.delete_object().bucket(bucket).key(key).send().await;
+    // Bound to the version just seen, so a write landing after the HEAD is not
+    // what gets deleted. A server that reports no ETag leaves nothing to bind to.
+    let _ = client.delete_object().bucket(bucket).key(key).set_if_match(etag).send().await;
     Err(format!(
         "{key}: stored size {} does not match the source ({expected} bytes)",
-        got.map_or("unknown".to_string(), |n| n.to_string())
+        size.map_or("unknown".to_string(), |n| n.to_string())
     ))
 }
 
-/// Writes a small object in one request and checks its stored size.
+/// Writes a small object in one request and checks what is stored afterwards.
 pub async fn put_object_verified(
     client: &Client,
     bucket: &str,
     key: &str,
     data: &[u8],
 ) -> Result<(), String> {
-    client
+    let put = client
         .put_object()
         .bucket(bucket)
         .key(key)
@@ -519,7 +552,77 @@ pub async fn put_object_verified(
         .send()
         .await
         .map_err(|e| format!("PUT {key}: {}", s3_err(&e)))?;
-    verify_object_size(client, bucket, key, data.len() as u64).await
+    verify_written(client, bucket, key, data.len() as u64, put.e_tag()).await
+}
+
+#[cfg(test)]
+mod written_tests {
+    use super::*;
+    use aws_sdk_s3::primitives::SdkBody;
+    use aws_smithy_http_client::test_util::infallible_client_fn;
+    use std::sync::{Arc, Mutex};
+
+    /// A client whose server holds one object, `size` bytes at `etag`, and
+    /// records each request as "METHOD if-match".
+    fn holding(size: u64, etag: &'static str) -> (Client, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let http = infallible_client_fn(move |req: http::Request<SdkBody>| {
+            let cond = req.headers().get("if-match").and_then(|v| v.to_str().ok()).unwrap_or("-");
+            log.lock().unwrap().push(format!("{} {cond}", req.method()));
+            let mut resp = http::Response::builder().status(if req.method() == "DELETE" { 204 } else { 200 });
+            if req.method() == "HEAD" {
+                resp = resp.header("content-length", size.to_string());
+                if !etag.is_empty() {
+                    resp = resp.header("etag", etag);
+                }
+            }
+            resp.body(SdkBody::empty()).unwrap()
+        });
+        let (client, _) =
+            s3_client_from_parts("https://gateway.test", "eu-ro-1", "b", "AKIDTEST", "not-a-secret");
+        let conf = client.config().to_builder().http_client(http).build();
+        (Client::from_conf(conf), seen)
+    }
+
+    #[tokio::test]
+    async fn the_object_this_write_made_passes() {
+        let (client, seen) = holding(10, "\"mine\"");
+        assert!(verify_written(&client, "b", "k", 10, Some("\"mine\"")).await.is_ok());
+        assert_eq!(*seen.lock().unwrap(), ["HEAD -"]);
+    }
+
+    #[tokio::test]
+    async fn another_writer_s_object_of_the_same_size_is_not_taken_for_ours() {
+        let (client, seen) = holding(10, "\"theirs\"");
+        assert!(verify_written(&client, "b", "k", 10, Some("\"mine\"")).await.is_err());
+        assert_eq!(*seen.lock().unwrap(), ["HEAD -"], "nothing is deleted");
+    }
+
+    #[tokio::test]
+    async fn another_writer_s_object_of_another_size_is_not_deleted() {
+        let (client, seen) = holding(99, "\"theirs\"");
+        assert!(verify_written(&client, "b", "k", 10, Some("\"mine\"")).await.is_err());
+        assert_eq!(*seen.lock().unwrap(), ["HEAD -"], "nothing is deleted");
+    }
+
+    #[tokio::test]
+    async fn our_own_object_of_the_wrong_size_is_deleted_as_that_version_only() {
+        let (client, seen) = holding(7, "\"mine\"");
+        assert!(verify_written(&client, "b", "k", 10, Some("\"mine\"")).await.is_err());
+        assert_eq!(*seen.lock().unwrap(), ["HEAD -", "DELETE \"mine\""]);
+    }
+
+    // A server that returns no ETag from the write: the version HEAD saw is
+    // the one the delete is bound to.
+    #[tokio::test]
+    async fn without_a_write_etag_the_delete_is_bound_to_what_head_saw() {
+        let (client, seen) = holding(7, "\"seen\"");
+        assert!(verify_written(&client, "b", "k", 10, None).await.is_err());
+        assert_eq!(*seen.lock().unwrap(), ["HEAD -", "DELETE \"seen\""]);
+        let (client, _) = holding(10, "\"seen\"");
+        assert!(verify_written(&client, "b", "k", 10, None).await.is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -796,6 +899,24 @@ mod page_guard_tests {
         assert!(guard.page(1000, Some("1")).is_ok());
         assert!(guard.page(1000, Some("2")).is_ok());
         assert!(guard.page(1000, None).is_err(), "3000 entries are over 2500");
+    }
+
+    #[test]
+    fn pages_that_carry_nothing_do_not_go_on_for_ever() {
+        let mut guard = PageGuard::new(u64::MAX);
+        let stopped = (0..1_000_000u32).any(|n| guard.page(0, Some(&format!("t{n}"))).is_err());
+        assert!(stopped, "a million empty pages with fresh tokens were all accepted");
+    }
+
+    #[test]
+    fn empty_pages_between_full_ones_are_part_of_a_normal_listing() {
+        let mut guard = PageGuard::new(u64::MAX);
+        for round in 0..200u32 {
+            for n in 0..100u32 {
+                assert!(guard.page(0, Some(&format!("e{round}-{n}"))).is_ok());
+            }
+            assert!(guard.page(1000, Some(&format!("f{round}"))).is_ok());
+        }
     }
 
     #[test]

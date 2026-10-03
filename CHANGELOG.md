@@ -1,5 +1,70 @@
 # Changelog
 
+## 1.2.1 - 2026-10-03
+
+Fixes after a second independent review, this time of the 1.2.0 source code,
+and a round of smaller corrections. Released under the Apache License 2.0, as
+before.
+
+### Security
+
+- After an upload, a copy or a rename on a volume, the app checks the object
+  it wrote by the ETag the server returned for that write, not only by its
+  size. An object written to the same name by someone else in the meantime is
+  neither taken for ours nor deleted, and a move keeps its source.
+- Changing a connection's endpoint removes its saved keys before the new
+  address is stored, so old keys cannot end up next to a new endpoint when the
+  credential store refuses the new ones. A save that fails now says so.
+- Two endpoints that differ only in the letter case of their path are treated
+  as different addresses; keys saved for one are not used for the other.
+- A connection's keys can be removed from the credential store without
+  deleting the connection: Remove keys, in Settings → Connections.
+- Thumbnails of very large images are decoded within a shared pixel budget,
+  so several of them at once can no longer take gigabytes of memory.
+- A listing stops with an error after 10,000 empty pages in a row, and a
+  Volume Cleanup scan follows only folders inside the one being scanned. A
+  faulty server can no longer keep a scan running or send it elsewhere.
+- The confirmation for aborting interrupted uploads says that uploads started
+  from another program or another computer are included.
+- Words that look like keys or signatures in a server's error message are
+  masked before the line is written to the log, including the log sent with
+  Feedback.
+- An older TLS stack, present only as a dependency default, is no longer part
+  of the build.
+
+### Packages
+
+- From this release on, packages are built on GitHub Actions from a commit of
+  this repository and come with a build attestation; the Installing section
+  of the README shows how to check one. Releases are immutable once
+  published, and commits and tags are signed.
+- The Windows `-setup.exe` uninstaller removes the stored keys when "Delete
+  the application data" is ticked. For the `.msi` package, macOS and Linux,
+  the new Uninstalling section of the README describes how to remove them.
+- The Windows `-setup.exe` uninstaller no longer leaves the install location
+  in the registry, where it made a later `.msi` install choose the wrong
+  folder.
+
+### Interface
+
+- In Feedback, what was called recording is now called logging: the button
+  reads "Log the problem", and the file is `feedback.log`. An unsent log left
+  by 1.2.0 is picked up under the new name.
+- Backspace also leaves a folder that is still loading or failed to open.
+- The drop target of a drag is drawn in the colour of the pane it is in, and
+  the badge that follows the pointer says "folder" or "items" when that is
+  what is being dragged.
+- At startup the sidebar's sections appear together instead of pushing each
+  other down, and "No connection configured" no longer shows for a moment
+  while the connection list is still loading.
+
+### Fixes
+
+- An interrupted upload is no longer started from the beginning when the
+  server fails once to list its parts; the next attempt continues from them.
+- A folder opened from outside the app (Open in BG Bucket Browser, or the
+  command line) no longer appears a second time in Recent.
+
 ## 1.2.0 - 2026-09-28
 
 Security hardening after an independent review of the 1.1.0 source code, and

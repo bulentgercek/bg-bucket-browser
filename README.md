@@ -1,6 +1,6 @@
 # BG Bucket Browser
 
-Version 1.2.0
+Version 1.2.1
 
 Created by Bulent Gercek
 
@@ -58,10 +58,10 @@ application replaces both with a direct, always-available file manager.
   uninstall; an AppImage has no install/uninstall step, so switching the
   toggle off before deleting it is the only way to remove the registration.
 - In-app feedback (Settings → Feedback): write a message and send it with one
-  press, with no email client or GitHub account needed. **Record the problem**
+  press, with no email client or GitHub account needed. **Log the problem**
   captures a detailed log for up to five minutes while you reproduce an issue;
   it is attached in its own read-only box, so you see exactly what will be
-  sent. A recording cut short by a crash is offered again on the next start.
+  sent. A log cut short by a crash is offered again on the next start.
 - Light, dark, and system theme, and four font sizes. Outside the panels,
   Ctrl + / - and Ctrl + mouse wheel step through them (Cmd on macOS); inside a
   panel they change its row and tile size.
@@ -111,6 +111,20 @@ past the warnings described below.
 - Windows, in PowerShell: `Get-FileHash <file>`
 - macOS, in Terminal: `shasum -a 256 <file>`
 
+Releases after 1.2.0 can be checked one step further. Their packages are built
+on GitHub Actions from a commit of this repository, and each one comes with a
+build attestation: a public, signed record of the commit and the workflow that
+produced the file. With the [GitHub CLI](https://cli.github.com):
+
+```
+gh attestation verify <file> --repo bulentgercek/bg-bucket-browser
+```
+
+The check passes only for a file built here; it says where the file comes
+from, not that the code is free of faults. Those releases are also immutable:
+once published, their packages cannot be replaced and their tag cannot be
+moved.
+
 **Linux:** no prebuilt package. A build made on your own system links against
 its own libraries, so it runs there without compatibility issues — see
 Building from source.
@@ -136,6 +150,22 @@ xattr -dr com.apple.quarantine "/Applications/BG Bucket Browser.app"
 
 The package is built for Intel (x64) and runs on Apple Silicon through
 Rosetta 2.
+
+## Uninstalling
+
+Access keys, secret keys and the RunPod API key are kept in the operating
+system's credential store (Credential Manager, Keychain, Secret Service), not
+among the app's own files. Removing the app does not always remove them.
+
+- **Windows, `-setup.exe`:** the uninstaller removes the stored keys when
+  "Delete the application data" is ticked.
+- **Windows `.msi`, macOS, Linux:** remove the keys in the app before you
+  uninstall it. In Settings → Connections, choose Remove keys for each
+  connection, and Remove for the RunPod API key.
+
+If the app is already gone, the entries can be deleted by hand: in Credential
+Manager their names end in `.bg-bucket-browser`; in Keychain Access, search
+for `bg-bucket-browser`.
 
 ## Building from source
 
@@ -220,21 +250,22 @@ cd src-tauri && cargo test
 ```
 
 Neither needs network access or credentials: S3 requests are intercepted and
-Tauri commands are mocked.
+Tauri commands are mocked. The same checks run on every push to this repository
+(`.github/workflows/ci.yml`), on Linux, Windows and macOS.
 
 ### Debug logging
 
 The application keeps a development log of its own, in two files, wherever the
-operating system puts application logs (a third one exists only while a
-feedback recording runs, see below):
+operating system puts application logs (a third one exists only while you
+log a problem for feedback, see below):
 
 - Linux: `~/.local/share/com.bulentgercek.bgbucketbrowser/logs/`
 - Windows: `%LOCALAPPDATA%\com.bulentgercek.bgbucketbrowser\logs\`
 - macOS: `~/Library/Logs/com.bulentgercek.bgbucketbrowser/`
 
-`toast.log` records every notification the interface shows, one line each. It
+`toast.log` holds every notification the interface shows, one line each. It
 is always written: each launch starts a new file and keeps the previous one as
-`toast.log.1`. `verbose.log` records the commands the interface called and the
+`toast.log.1`. `verbose.log` holds the commands the interface called and the
 internal detail around them, and rotates to `verbose.log.1` past 5 MB. Both
 open with a `=== session ... ===` line and close with `=== session end ... ===`
 when the application exits normally, so a missing end line means it was killed
@@ -246,13 +277,13 @@ copy, which holds files that are not published here, have it on by default.
 Neither file is configurable from the interface, neither is sent anywhere, and
 credentials are never written to either.
 
-While you record a problem from Settings → Feedback, the same detail is also
-written to `recording.log` in that folder, whatever the verbose setting is.
+While you log a problem from Settings → Feedback, the same detail is also
+written to `feedback.log` in that folder, whatever the verbose setting is.
 It contains file names and paths, but no credentials. It leaves your computer
 only when you press **Send**: the report goes over HTTPS to
 `https://bulentgercek.com/feedback`, which forwards it to the developer by
 email and deletes its copy 30 days after delivery. The file is deleted once the report is
-accepted, or when you remove the recording. A report sent from any build of
+accepted, or when you remove the log. A report sent from any build of
 this repository, including one started with `npx tauri dev`, reaches the
 developer this way. Only builds from the developer's own working copy send to
 the service's test channel, where nothing is stored or delivered.

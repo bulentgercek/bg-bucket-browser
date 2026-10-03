@@ -11,7 +11,7 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -436,12 +436,57 @@ fn pixels_ok(width: u32, height: u32, max_pixels: u64) -> bool {
     u64::from(width) * u64::from(height) <= max_pixels
 }
 
-fn encode_thumb(bytes: &[u8]) -> Option<Vec<u8>> {
-    encode_thumb_within(bytes, MAX_PIXELS)
+/// All the pixels that may be in decode at once, over every thumbnail being
+/// made: one image at the limit, or several smaller ones. However many tiles
+/// ask together, a decode holds about one large image's worth of memory.
+static DECODE_BUDGET: PixelBudget = PixelBudget::new(MAX_PIXELS);
+
+/// A gate counted in pixels: a decode waits until its pixels fit under the cap.
+struct PixelBudget {
+    cap: u64,
+    used: Mutex<u64>,
+    freed: Condvar,
 }
 
-/// `encode_thumb` with the pixel budget as a parameter, so a test can use a small one.
-fn encode_thumb_within(bytes: &[u8], max_pixels: u64) -> Option<Vec<u8>> {
+impl PixelBudget {
+    const fn new(cap: u64) -> Self {
+        PixelBudget { cap, used: Mutex::new(0), freed: Condvar::new() }
+    }
+
+    /// Waits until `pixels` fit, then holds them until the returned guard is
+    /// dropped. A request above the cap counts as the whole cap: it runs alone
+    /// instead of never.
+    fn hold(&self, pixels: u64) -> PixelHold<'_> {
+        let pixels = pixels.clamp(1, self.cap);
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        while *used + pixels > self.cap {
+            used = self.freed.wait(used).unwrap_or_else(|e| e.into_inner());
+        }
+        *used += pixels;
+        PixelHold { budget: self, pixels }
+    }
+}
+
+/// The pixels one decode holds; dropping it gives them back.
+struct PixelHold<'a> {
+    budget: &'a PixelBudget,
+    pixels: u64,
+}
+
+impl Drop for PixelHold<'_> {
+    fn drop(&mut self) {
+        *self.budget.used.lock().unwrap_or_else(|e| e.into_inner()) -= self.pixels;
+        self.budget.freed.notify_all();
+    }
+}
+
+fn encode_thumb(bytes: &[u8]) -> Option<Vec<u8>> {
+    encode_thumb_within(bytes, MAX_PIXELS, &DECODE_BUDGET)
+}
+
+/// `encode_thumb` with the pixel limit and the budget as parameters, so a test
+/// can use small ones.
+fn encode_thumb_within(bytes: &[u8], max_pixels: u64, budget: &PixelBudget) -> Option<Vec<u8>> {
     let reader = || ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok();
     // The size is read from the header first, so a huge image is never decoded.
     let (width, height) = reader()?.into_dimensions().ok()?;
@@ -449,7 +494,12 @@ fn encode_thumb_within(bytes: &[u8], max_pixels: u64) -> Option<Vec<u8>> {
         return None;
     }
     let mut decoder = reader()?;
-    if decoder.format() == Some(ImageFormat::Gif) {
+    let is_gif = decoder.format() == Some(ImageFormat::Gif);
+    // Held until the thumbnail is encoded. A GIF takes the whole budget: its
+    // header does not say how large a frame is.
+    let pixels = if is_gif { budget.cap } else { u64::from(width) * u64::from(height) };
+    let _held = budget.hold(pixels);
+    if is_gif {
         // A GIF's header gives the screen size, and a frame may be larger than
         // its screen: the decoder's allocation limit covers what the check above
         // cannot see. A GIF always decodes to 4 bytes a pixel.
@@ -553,7 +603,68 @@ fn enforce_cap(dir: &Path) {
 
 #[cfg(test)]
 mod pixel_tests {
-    use super::{MAX_PIXELS, encode_thumb_within, pixels_ok};
+    use super::{MAX_PIXELS, PixelBudget, encode_thumb_within, pixels_ok};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(width, height).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn decodes_running_together_never_hold_more_pixels_than_the_budget() {
+        let budget = Arc::new(PixelBudget::new(100));
+        let now = Arc::new(AtomicU64::new(0));
+        let peak = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..12)
+            .map(|_| {
+                let (budget, now, peak) = (budget.clone(), now.clone(), peak.clone());
+                std::thread::spawn(move || {
+                    let _held = budget.hold(40);
+                    peak.fetch_max(now.fetch_add(40, Ordering::SeqCst) + 40, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                    now.fetch_sub(40, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= 80, "{peak} pixels at once: two of 40 fit under 100, a third does not");
+    }
+
+    #[test]
+    fn a_decode_larger_than_the_whole_budget_runs_alone_instead_of_never() {
+        let budget = PixelBudget::new(100);
+        let held = budget.hold(5_000);
+        assert_eq!(held.pixels, 100);
+        drop(held);
+        assert_eq!(budget.hold(0).pixels, 1);
+    }
+
+    #[test]
+    fn a_thumbnail_waits_while_the_budget_is_taken() {
+        let budget = Arc::new(PixelBudget::new(10_000));
+        let image = png(100, 100); // exactly the whole budget
+        let held = budget.hold(1);
+        let done = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let (budget, done) = (budget.clone(), done.clone());
+            std::thread::spawn(move || {
+                let out = encode_thumb_within(&image, MAX_PIXELS, &budget);
+                done.store(true, Ordering::SeqCst);
+                out.is_some()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!done.load(Ordering::SeqCst), "decoded although its pixels did not fit");
+        drop(held);
+        assert!(worker.join().unwrap());
+    }
 
     #[test]
     fn an_image_above_100_megapixels_gets_the_type_icon() {
@@ -580,8 +691,9 @@ mod pixel_tests {
     #[test]
     fn a_gif_frame_larger_than_its_screen_stays_within_the_budget() {
         let gif = gif_with_small_screen();
-        assert!(encode_thumb_within(&gif, 10_000).is_some(), "400 pixels fit a budget of 10000");
-        assert!(encode_thumb_within(&gif, 100).is_none(), "400 pixels must not fit a budget of 100");
+        let budget = PixelBudget::new(MAX_PIXELS);
+        assert!(encode_thumb_within(&gif, 10_000, &budget).is_some(), "400 pixels fit a budget of 10000");
+        assert!(encode_thumb_within(&gif, 100, &budget).is_none(), "400 pixels must not fit a budget of 100");
     }
 }
 

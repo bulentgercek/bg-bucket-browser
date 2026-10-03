@@ -254,7 +254,7 @@ const FileRow = memo(function FileRow({
       className={
         `${gridClass} items-center rounded-sm px-2 transition-colors duration-150 ${rowClass} ` +
         (dropOn
-          ? "bg-[color-mix(in_srgb,var(--color-accent)_14%,transparent)] outline outline-1 -outline-offset-1 outline-dashed outline-accent-400"
+          ? `${sel.dropFill} outline outline-1 -outline-offset-1 outline-dashed ${sel.dropOutline}`
           : cursor
             ? // The cursor outline is brighter than the selection outline, so
               // it stays visible on a row that is also selected.

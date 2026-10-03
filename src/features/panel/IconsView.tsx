@@ -65,12 +65,16 @@ function isImage(name: string): boolean {
    that the default is fine for them. */
 const DRAG_CHIP = 56;
 
-export function iconsDragImage(e: ReactDragEvent, thumbUri: string | undefined) {
+export function iconsDragImage(
+  e: ReactDragEvent,
+  thumbUri: string | undefined,
+  side: PaneSide,
+) {
   if (!thumbUri) return;
   const chip = document.createElement("div");
   chip.style.cssText =
     `position:fixed;top:-200px;left:-200px;width:${DRAG_CHIP}px;height:${DRAG_CHIP}px;` +
-    "border-radius:6px;overflow:hidden;border:1px solid var(--color-accent-600);" +
+    `border-radius:6px;overflow:hidden;border:1px solid ${SELECTION[side].dragChipBorder};` +
     "box-shadow:0 4px 12px rgba(0,0,0,.35);background:#101119";
   const img = document.createElement("img");
   img.src = thumbUri;
@@ -328,7 +332,7 @@ const IconTile = memo(function IconTile({
       className={
         "flex flex-col items-center gap-1.5 rounded-md px-1.5 py-2 transition-colors duration-150 " +
         (dropOn
-          ? "bg-[color-mix(in_srgb,var(--color-accent)_14%,transparent)] outline outline-1 -outline-offset-1 outline-dashed outline-accent-400"
+          ? `${sel.dropFill} outline outline-1 -outline-offset-1 outline-dashed ${sel.dropOutline}`
           : selected
             ? // A tile is mostly its picture, which hides the fill a selected
               // row shows; the selection is a thick outline instead, and the

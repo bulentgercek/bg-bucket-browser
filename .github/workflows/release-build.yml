@@ -6,10 +6,9 @@ name: Release build
 # attached to a release by hand.
 
 on:
-  # A version tag builds the packages of that release.
-  push:
-    tags: ["v*"]
-  # A manual run builds the same packages from any ref, to try the workflow out.
+  # Started by hand, on the commit a release will be made from. Not by a tag:
+  # the tag is created only after these packages have been installed and
+  # tried, and it must not start a second build of files nobody tested.
   workflow_dispatch:
 
 permissions:
@@ -39,15 +38,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: The tag matches the version
-        if: github.ref_type == 'tag'
-        run: |
-          version="$(node -p "require('./package.json').version")"
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version"
-            exit 1
-          fi
 
       # No dependency cache: a release build starts from the lock files alone.
       - name: Node

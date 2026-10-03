@@ -181,6 +181,11 @@ function beginRequest(tabId: string): {
   };
 }
 
+/** What each loading tab is waiting for, and whether the folder it showed
+    before is still there to go back to. Not part of the tab: nothing draws
+    from it, and it must not be persisted. */
+const pendingLoad = new Map<string, { path: string; shownIsValid: boolean }>();
+
 /** Keeps only the selected entries that are on screen. What is selected is
     what an action takes, so an entry the filter or the hidden-files setting
     has taken out of view leaves the selection too. */
@@ -242,6 +247,9 @@ interface PaneStore {
   refresh: (index: PaneIndex, tabId?: string) => Promise<void>;
   /** Goes up one level; at a root, nothing happens. */
   goParent: (index: PaneIndex) => Promise<void>;
+  /** Backspace while a folder is loading: back to the folder shown before, or,
+      with none, up from the folder being loaded. */
+  backOutOfLoad: (index: PaneIndex) => Promise<void>;
   /** Opens an entry: a folder in the pane, a local file in its default
       application. A remote file is opened from the queue instead, because it
       has to be downloaded first. */
@@ -370,6 +378,12 @@ persist((set, get) => ({
     const side = get().panes[index].side;
     const id = tabId ?? get().panes[index].activeTabId;
     const { isLatest, lane } = beginRequest(id);
+    const was = get().panes[index].tabs.find((tb) => tb.id === id);
+    pendingLoad.set(id, {
+      path,
+      // A load started over another keeps what was true before the first one.
+      shownIsValid: pendingLoad.get(id)?.shownIsValid ?? was?.status === "ready",
+    });
     set({
       panes: patchTab(get().panes, index, id, (tb) => ({
         ...tb,
@@ -384,6 +398,7 @@ persist((set, get) => ({
       const listing =
         side === "remote" ? await listRemote(path, undefined, lane) : await listLocal(path);
       if (!isLatest()) return;
+      pendingLoad.delete(id);
       // Only a folder that actually opened is worth remembering.
       useRecentStore.getState().visit(side, path);
       // Each connection remembers where it was left, so switching back returns
@@ -410,6 +425,7 @@ persist((set, get) => ({
       });
     } catch (e) {
       if (!isLatest()) return;
+      pendingLoad.delete(id);
       set({
         panes: patchTab(get().panes, index, id, (tb) => ({
           ...tb,
@@ -492,6 +508,31 @@ persist((set, get) => ({
         })),
       });
     }
+  },
+
+  backOutOfLoad: async (index) => {
+    const pane = get().panes[index];
+    const tab = pane.tabs.find((tb) => tb.id === pane.activeTabId);
+    if (!tab || tab.status !== "loading") return;
+    const waiting = pendingLoad.get(tab.id);
+    if (waiting?.shownIsValid) {
+      // The folder shown before the load is still whole: the load is dropped
+      // and its answer, when it comes, is not the latest any more.
+      beginRequest(tab.id);
+      pendingLoad.delete(tab.id);
+      set({
+        panes: patchTab(get().panes, index, tab.id, (tb) => ({ ...tb, status: "ready" })),
+      });
+      return;
+    }
+    // Nothing to go back to (a tab's first load, or a retry after a failure):
+    // the way out is the folder above the one being loaded.
+    const target = waiting?.path ?? tab.path;
+    const parent = parentPath(target, pane.side);
+    const here = target === "/" ? "/" : target.replace(/\/+$/, "");
+    if (parent === here) return; // loading a root: nowhere else to go
+    pendingLoad.delete(tab.id);
+    await get().navigate(index, parent);
   },
 
   goParent: async (index) => {

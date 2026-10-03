@@ -147,16 +147,39 @@ fn may_use_stored_keys(saved_endpoint: Option<&str>, form_endpoint: &str) -> boo
     saved_endpoint.is_some_and(|saved| same_endpoint(saved, form_endpoint))
 }
 
-/// Two spellings of one endpoint: case, surrounding spaces and a trailing `/`
-/// do not change where a request goes.
+/// Two spellings of one endpoint: surrounding spaces, a trailing `/`, and case
+/// in the scheme and the host do not change where a request goes. Case in the
+/// path does: a server may route `/base` and `/BASE` to different places.
 pub(crate) fn same_endpoint(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.trim().trim_end_matches('/').to_ascii_lowercase();
-    norm(a) == norm(b)
+    // Up to the first `/` after `://` is scheme and host; the rest is the path.
+    fn parts(s: &str) -> (String, &str) {
+        let s = s.trim().trim_end_matches('/');
+        let host_at = s.find("://").map_or(0, |i| i + 3);
+        let path_at = s[host_at..].find('/').map_or(s.len(), |i| host_at + i);
+        (s[..path_at].to_ascii_lowercase(), &s[path_at..])
+    }
+    parts(a) == parts(b)
 }
 
 #[cfg(test)]
 mod stored_key_tests {
-    use super::may_use_stored_keys;
+    use super::{may_use_stored_keys, same_endpoint};
+
+    #[test]
+    fn two_endpoints_are_the_same_only_when_their_paths_match_exactly() {
+        let saved = "https://s3.example.com:8443/base";
+        // Case never matters in the scheme or the host, nor does a trailing `/`.
+        assert!(same_endpoint(saved, "HTTPS://S3.Example.COM:8443/base/"));
+        assert!(same_endpoint("https://S3api-EU-ro-1.runpod.io", "https://s3api-eu-ro-1.runpod.io/ "));
+        // A path is case-sensitive: another spelling may be another server's route.
+        assert!(!same_endpoint(saved, "https://s3.example.com:8443/BASE"));
+        assert!(!same_endpoint(saved, "https://s3.example.com:8443/Base/"));
+        assert!(!may_use_stored_keys(Some(saved), "https://s3.example.com:8443/BASE"));
+        // A different path or port is a different endpoint, as before.
+        assert!(!same_endpoint(saved, "https://s3.example.com:8443/other"));
+        assert!(!same_endpoint(saved, "https://s3.example.com:9443/base"));
+        assert!(!same_endpoint(saved, "https://s3.example.com:8443"));
+    }
 
     #[test]
     fn stored_keys_go_only_to_the_endpoint_they_were_saved_for() {

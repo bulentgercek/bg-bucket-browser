@@ -1,0 +1,110 @@
+name: CI
+
+# Runs the checks a release goes through by hand: the frontend build and its
+# tests, then the Rust lints and tests. No network or credentials are needed;
+# S3 requests are intercepted and Tauri commands are mocked.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    # Every push in the public repository; anywhere else only when started by hand.
+    if: github.repository == 'bulentgercek/bg-bucket-browser' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to a commit: a tag can be moved, a commit cannot.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The packages the README lists for building on Debian and Ubuntu.
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libdbus-1-dev
+
+      - name: Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+
+      - name: Dependencies
+        run: npm ci
+
+      # The Rust side embeds the built frontend, so this comes first.
+      - name: Frontend build
+        run: npm run build
+
+      - name: Frontend tests
+        run: npm test
+
+      # Warnings fail the run: the code is kept free of them.
+      - name: Rust lints
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
+  other-platforms:
+    # Windows and macOS compile code Linux never sees; the tests run there too.
+    # Only in the public repository: these runners cost several times a Linux
+    # one where minutes are counted.
+    if: github.repository == 'bulentgercek/bg-bucket-browser'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Dependencies
+        run: npm ci
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Frontend tests
+        run: npm test
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test

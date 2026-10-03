@@ -16,13 +16,16 @@ pub struct OpenHereState(pub Mutex<Option<String>>);
 /// The folder this launch was asked to open, if it was asked at all.
 ///
 /// Anything that is not a directory is ignored, so a stray argument cannot send
-/// the pane somewhere meaningless.
+/// the pane somewhere meaningless. The folder is returned the way a pane writes
+/// it, so it is the same place as when it is reached from inside the app.
 #[tauri::command]
 pub fn take_startup_path(state: tauri::State<OpenHereState>) -> Option<String> {
     let candidate = std::env::args()
         .nth(1)
         .or_else(|| state.0.lock().unwrap().take());
-    candidate.filter(|p| std::path::Path::new(p).is_dir())
+    candidate
+        .filter(|p| std::path::Path::new(p).is_dir())
+        .map(|p| crate::local_path::pane_path(&p))
 }
 
 #[tauri::command]

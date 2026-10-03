@@ -58,6 +58,7 @@ pub fn run() {
             config::set_active_connection,
             config::rename_connection,
             config::delete_connection,
+            config::remove_connection_keys,
             config::set_runpod_api_key,
             config::has_runpod_api_key,
             runpod::volume_quota,
@@ -150,7 +151,7 @@ pub fn run() {
                     if let Some(state) = app.try_state::<desktop_integration::OpenHereState>() {
                         *state.0.lock().unwrap() = Some(path.clone());
                     }
-                    let _ = app.emit("open-here", path);
+                    let _ = app.emit("open-here", local_path::pane_path(&path));
                 }
             }
         });

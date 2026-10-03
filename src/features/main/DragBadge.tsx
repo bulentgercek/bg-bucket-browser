@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { FilesIcon, ProhibitIcon } from "@phosphor-icons/react";
 import { useDragStore } from "../../state/dragStore";
+import { dragNounKey } from "../../lib/dragNoun";
 import { IS_WINDOWS } from "../../lib/platform";
 import { t } from "../../locale/en";
 
@@ -53,7 +54,7 @@ export default function DragBadge() {
   if (!dest && IS_WINDOWS) return null;
 
   const n = payload.items.length;
-  const noun = t(n === 1 ? "dnd.file" : "dnd.files");
+  const noun = t(dragNounKey(payload.items));
 
   // The badge is centred on the pointer rather than aligned to either edge:
   // its text changes length as the target changes, and anchoring one edge makes

@@ -144,8 +144,12 @@ async fn list_dir(
             e.to_string()
         })?;
         let elapsed = page_started.elapsed();
+        // Subfolders count too: a page that only names folders is not an empty one.
         guard
-            .page(resp.contents().len(), resp.next_continuation_token())
+            .page(
+                resp.contents().len() + resp.common_prefixes().len(),
+                resp.next_continuation_token(),
+            )
             .map_err(|stop| stop.to_string())?;
 
         let mut page_count: u64 = 0;
@@ -163,12 +167,16 @@ async fn list_dir(
                 tally.add_object(key, size, obj.e_tag().unwrap_or_default());
             }
         }
-        dirs.extend(
-            resp.common_prefixes()
-                .iter()
-                .filter_map(|p| p.prefix())
-                .map(str::to_string),
-        );
+        let named = resp.common_prefixes().len();
+        let before = dirs.len();
+        dirs.extend(child_dirs(&prefix, resp.common_prefixes().iter().filter_map(|p| p.prefix())));
+        let dropped = named - (dirs.len() - before);
+        if dropped > 0 {
+            crate::devlog::verbose(
+                "cleanup",
+                format!("{dropped} folder(s) named outside {prefix:?} were not followed"),
+            );
+        }
         if elapsed > SLOW_PAGE {
             crate::devlog::verbose(
                 "cleanup",
@@ -186,6 +194,19 @@ async fn list_dir(
         );
     }
     Ok(dirs)
+}
+
+/// The subfolders a page of `prefix`'s listing names, as prefixes to list next.
+///
+/// Only a folder directly inside `prefix` is followed: the ones a pane listing
+/// the same folder would show. Anything else is what a broken or hostile server
+/// returns, and following it would send the scan back up the tree or round in
+/// circles.
+fn child_dirs<'a>(prefix: &str, returned: impl Iterator<Item = &'a str>) -> Vec<String> {
+    returned
+        .filter(|full| crate::listing::dir_entry_name(prefix, full).is_some())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Length of the "reclaimable" and "not scanned" lists.
@@ -455,6 +476,26 @@ async fn delete_picks(client: &Client, bucket: &str, picks: &[ScanPick]) -> Dele
 pub async fn delete_scanned(app: AppHandle, picks: Vec<ScanPick>) -> Result<DeleteReport, String> {
     let (client, bucket) = active_client(&app).map_err(|e| e.to_string())?;
     Ok(delete_picks(&client, &bucket, &picks).await)
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::child_dirs;
+
+    #[test]
+    fn a_scan_follows_only_the_folders_inside_the_one_it_listed() {
+        let returned = [
+            "models/loras/",   // a subfolder
+            "models/",         // the folder itself
+            "",                // the root
+            "output/",         // a sibling
+            "models",          // the folder's own name without the slash
+            "models/a/b/",     // two levels down: not what a delimiter listing returns
+            "models/vae/",     // a subfolder
+        ];
+        assert_eq!(child_dirs("models/", returned.into_iter()), ["models/loras/", "models/vae/"]);
+        assert_eq!(child_dirs("", ["models/", "", "/", "a/b/"].into_iter()), ["models/"]);
+    }
 }
 
 #[cfg(test)]

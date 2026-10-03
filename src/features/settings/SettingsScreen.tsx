@@ -15,6 +15,7 @@ import {
 } from "@phosphor-icons/react";
 import {
   testConnection,
+  removeConnectionKeys,
   saveConnection,
   renameConnection,
   deleteConnection,
@@ -402,7 +403,10 @@ function ConnectionBlock({
       ) {
         useToastStore.getState().push(t(`settings.connections.${err}`), "error");
       } else {
-        throw err;
+        // Anything else is the keychain or the store refusing. The block is
+        // read again: a changed endpoint has given up its stored keys by now.
+        useToastStore.getState().push(String(err), "error");
+        onChanged(id);
       }
     } finally {
       setSaving(false);
@@ -433,6 +437,41 @@ function ConnectionBlock({
         },
       });
     }
+  }
+
+  // Removing the keys is an action of its own: an empty field means "keep it",
+  // and the first connection cannot be deleted to get rid of them.
+  function removeKeys() {
+    // A transfer still being prepared is not in the Rust queue yet; it would
+    // start without keys.
+    if (isPreparingOn(id)) {
+      useToastStore.getState().push(t("settings.connections.busyKeys"), "error");
+      return;
+    }
+    useDialogStore.getState().show({
+      kind: "confirm",
+      title: t("settings.connections.removeKeysTitle"),
+      body: t("settings.connections.removeKeysBody", { name }),
+      confirmLabel: t("settings.connections.removeKeys"),
+      danger: true,
+      onConfirm: () => {
+        useDialogStore.getState().close();
+        void removeConnectionKeys(id)
+          .then(() => {
+            setAccessKey("");
+            setSecretKey("");
+            useToastStore.getState().push(t("settings.connections.keysRemoved"));
+            onChanged(id);
+          })
+          // Read again either way: the keychain may have let one of the two go.
+          .catch((e: unknown) => {
+            useToastStore
+              .getState()
+              .push(e === "busy" ? t("settings.connections.busyKeys") : String(e), "error");
+            onChanged(id);
+          });
+      },
+    });
   }
 
   function remove() {
@@ -591,17 +630,29 @@ function ConnectionBlock({
             {t("settings.connections.delete")}
           </button>
         )}
-        <button
-          type="button"
-          className={
-            "btn btn-primary " +
-            (!dirty || saving ? "pointer-events-none opacity-40" : "")
-          }
-          disabled={!dirty || saving}
-          onClick={save}
-        >
-          {t("settings.action.save")}
-        </button>
+        <div className="flex items-center gap-[10px]">
+          {conn && (conn.hasAccessKey || conn.hasSecretKey) && (
+            <button
+              type="button"
+              className={"btn btn-ghost " + (saving ? "pointer-events-none opacity-40" : "")}
+              disabled={saving}
+              onClick={removeKeys}
+            >
+              {t("settings.connections.removeKeys")}
+            </button>
+          )}
+          <button
+            type="button"
+            className={
+              "btn btn-primary " +
+              (!dirty || saving ? "pointer-events-none opacity-40" : "")
+            }
+            disabled={!dirty || saving}
+            onClick={save}
+          >
+            {t("settings.action.save")}
+          </button>
+        </div>
       </div>
     </div>
   );

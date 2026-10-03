@@ -625,8 +625,8 @@ export async function initTransferEvents(): Promise<void> {
   wired = true;
   const s = useTransferStore.getState();
 
-  // The event also carries the backend's own speed figure; the queue works the
-  // speed out itself (`rate.ts`).
+  // The event carries bytes only; the queue works the speed out itself
+  // (`rate.ts`).
   await listen<{ id: string; bytesDone: number; bytesTotal: number }>(
     "transfer-progress",
     (e) => {

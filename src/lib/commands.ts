@@ -18,13 +18,18 @@ const LOG_NO_ARGS = new Set([
   "feedback_send",
 ]);
 
-/** High-frequency commands: logged only when they fail. */
+/** Commands logged only when they fail: the high-frequency ones, and the two
+    that frame a feedback log. */
 const LOG_ERRORS_ONLY = new Set([
   "read_os_clipboard_files",
   "get_thumbnail",
   "disk_usage",
   "list_devices",
   "volume_quota",
+  // Their lines would open and close the log the user reads before sending
+  // it; the backend marks both moments itself (`feedback.rs`).
+  "feedback_record_start",
+  "feedback_record_stop",
 ]);
 
 const LOG_MAX_CHARS = 600;
@@ -384,6 +389,11 @@ export function renameConnection(id: string, name: string): Promise<void> {
 /** Deletes a connection, with the keys it owns. */
 export function deleteConnection(id: string): Promise<void> {
   return invoke("delete_connection", { id });
+}
+
+/** Removes a connection's two keys from the keychain; the connection stays. */
+export function removeConnectionKeys(id: string): Promise<void> {
+  return invoke("remove_connection_keys", { id });
 }
 
 /** The live connection alone; the list is what today's screens read. */

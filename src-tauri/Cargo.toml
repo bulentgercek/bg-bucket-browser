@@ -1,6 +1,6 @@
 [package]
 name = "bg-bucket-browser"
-version = "1.2.0"
+version = "1.2.1"
 authors = ["Bulent Gercek"]
 edition = "2024"
 license = "Apache-2.0"
@@ -27,7 +27,14 @@ tauri-plugin-window-state = "2"
 # The S3 client. A custom endpoint and path-style addressing are what the
 # gateway needs, and this supports both; its own re-exports cover the
 # configuration types, so no separate configuration crate is needed.
-aws-sdk-s3 = "1"
+# The defaults minus `rustls`: that feature is the SDK's legacy connector and
+# brings a second, older TLS stack into the build that nothing here runs on.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+  "sigv4a",
+  "http-1x",
+  "default-https-client",
+  "rt-tokio",
+] }
 
 # Already under the SDK, but named directly for the one type that lets a request
 # be signed without hashing its body — which is what the gateway requires.

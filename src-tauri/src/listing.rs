@@ -242,7 +242,7 @@ pub async fn list_remote(
         guard.page(items, resp.next_continuation_token()).map_err(|stop| {
             let kind = match stop {
                 PageStop::TooMany(_) => ListErrKind::TooLarge,
-                PageStop::Loop => ListErrKind::Unknown,
+                PageStop::Loop | PageStop::Empty(_) => ListErrKind::Unknown,
             };
             ListErr::new(kind, stop.to_string())
         })?;
@@ -287,7 +287,7 @@ pub async fn list_remote(
 /// The name a common prefix shows as in the listing of `prefix`: the part
 /// after it, without the trailing slash. `None` for one outside `prefix` or
 /// with a slash inside, which only a broken or hostile server returns.
-fn dir_entry_name<'a>(prefix: &str, full: &'a str) -> Option<&'a str> {
+pub(crate) fn dir_entry_name<'a>(prefix: &str, full: &'a str) -> Option<&'a str> {
     let name = full.strip_prefix(prefix)?.trim_end_matches('/');
     (!name.is_empty() && !name.contains('/')).then_some(name)
 }

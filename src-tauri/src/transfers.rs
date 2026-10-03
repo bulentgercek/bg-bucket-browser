@@ -20,7 +20,7 @@ use aws_sdk_s3::config::interceptors::{
 };
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
-use aws_sdk_s3::error::{BoxError, DisplayErrorContext};
+use aws_sdk_s3::error::{BoxError, DisplayErrorContext, ProvideErrorMetadata};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use base64::Engine as _;
@@ -31,7 +31,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinSet;
 
 use crate::config::{active_client, active_connection_id, client_by_id};
-use crate::core::{PageGuard, TREE_MAX_ENTRIES, put_object_verified, s3_err, verify_object_size};
+use crate::core::{PageGuard, TREE_MAX_ENTRIES, put_object_verified, s3_err, verify_written};
 use crate::zip_writer::ZipOut;
 use crate::fs_ops::ensure_not_root;
 use crate::local_path::resolve_local;
@@ -228,7 +228,6 @@ struct ProgressEvt {
     id: String,
     bytes_done: u64,
     bytes_total: u64,
-    speed: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -740,7 +739,7 @@ async fn run_open_download(app: &AppHandle, job: &Job) -> Result<Outcome, String
         && meta.is_file()
         && meta.len() == size
     {
-        emit_progress(app, &job.id, size, size, 0);
+        emit_progress(app, &job.id, size, size);
         make_read_only(&cache_path);
         opener::open(&cache_path).map_err(|e| e.to_string())?;
         return Ok(Outcome::Done);
@@ -1259,8 +1258,8 @@ fn folder_item<'a>(prefix: &str, key: &'a str, size: u64) -> Option<FolderItem<'
     Some(FolderItem::File(rel))
 }
 
-/// Progress context of a folder job: bytes already done, the folder total, and its clock.
-type Agg = Option<(u64, u64, Instant)>;
+/// Progress context of a folder job: bytes already done and the folder total.
+type Agg = Option<(u64, u64)>;
 
 async fn run_download(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
     let (client, bucket) = s3_job(app, &job.conn_id)?;
@@ -1309,9 +1308,8 @@ async fn run_download(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
         .filter(|(k, sz, _)| matches!(folder_item(&prefix, k, *sz), Some(FolderItem::File(_))))
         .map(|(_, sz, _)| *sz)
         .sum();
-    let clock = Instant::now();
     let mut done: u64 = 0;
-    emit_progress(app, &job.id, 0, total, 0);
+    emit_progress(app, &job.id, 0, total);
 
     let mut left = LeftOut::default();
     // The folder's own marker never arrives; one that holds data must stay.
@@ -1347,7 +1345,7 @@ async fn run_download(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
         emit_current_file(app, &job.id, rel);
         match download_one(
             app, &clients, &bucket, key, &out, &job.id, &job.cancel,
-            Some((done, total, clock)), &job.conflict,
+            Some((done, total)), &job.conflict,
         )
         .await
         {
@@ -1361,7 +1359,7 @@ async fn run_download(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
         }
         done += *sz;
     }
-    emit_progress(app, &job.id, total, total, 0);
+    emit_progress(app, &job.id, total, total);
     emit_skipped(app, &job.id, &job.name, &left);
     Ok(Outcome::Done)
 }
@@ -1475,19 +1473,10 @@ async fn download_one(
     part.set_len(total).map_err(|e| e.to_string())?;
     let part = Arc::new(Mutex::new(part));
 
-    let file_started = Instant::now();
     let start_bytes = watermark * DOWNLOAD_CHUNK;
     let fetched = Arc::new(AtomicU64::new(start_bytes));
-    let (base, grand_total, clock) = agg.unwrap_or((0, total, file_started));
-    let emit = |done: u64| {
-        let cur = base + done;
-        let (spd_bytes, spd_clock) = match agg {
-            Some(_) => (cur, clock),
-            None => (done - start_bytes, file_started),
-        };
-        let secs = spd_clock.elapsed().as_secs_f64().max(0.001);
-        emit_progress(app, id, cur, grand_total, (spd_bytes as f64 / secs) as u64);
-    };
+    let (base, grand_total) = agg.unwrap_or((0, total));
+    let emit = |done: u64| emit_progress(app, id, base + done, grand_total);
     emit(start_bytes);
 
     // Chunks in flight, plus the ones that finished ahead of the watermark.
@@ -1721,7 +1710,6 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
     };
     let done: std::collections::HashSet<String> = out.names().map(str::to_string).collect();
 
-    let clock = Instant::now();
     // On a resume the already archived members count as progress from the start.
     let mut written: u64 = members
         .iter()
@@ -1729,7 +1717,7 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
         .map(|(_, _, sz, _)| *sz)
         .sum();
     let mut last_emit = Instant::now() - EMIT_EVERY;
-    emit_progress(app, &job.id, written, grand_total, 0);
+    emit_progress(app, &job.id, written, grand_total);
 
     for (key, arc_name, sz, etag) in &members {
         if done.contains(arc_name) {
@@ -1757,14 +1745,7 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
             off += data.len() as u64;
             written += data.len() as u64;
             if last_emit.elapsed() >= EMIT_EVERY {
-                let secs = clock.elapsed().as_secs_f64().max(0.001);
-                emit_progress(
-                    app,
-                    &job.id,
-                    written,
-                    grand_total,
-                    (written as f64 / secs) as u64,
-                );
+                emit_progress(app, &job.id, written, grand_total);
                 last_emit = Instant::now();
             }
         }
@@ -1776,7 +1757,7 @@ async fn run_download_zip(app: &AppHandle, job: &Job) -> Result<Outcome, String>
     let name = free_local_name(&dest_root, &zip_name);
     mark_from_network(&out_path); // before the rename, as in `download_one`
     fs::rename(&out_path, dest_root.join(&name)).map_err(|e| e.to_string())?;
-    emit_progress(app, &job.id, grand_total, grand_total, 0);
+    emit_progress(app, &job.id, grand_total, grand_total);
     Ok(Outcome::Done)
 }
 
@@ -1802,7 +1783,7 @@ async fn run_local_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
     // A source chosen through a link is copied instead, so its content arrives on
     // every disk alike and only the link is removed afterwards.
     if is_move && !is_link(&src) && !dest.exists() && fs::rename(&src, &dest).is_ok() {
-        emit_progress(app, &job.id, 1, 1, 0);
+        emit_progress(app, &job.id, 1, 1);
         return Ok(Outcome::Done);
     }
 
@@ -1817,10 +1798,9 @@ async fn run_local_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
             fs::create_dir_all(dest.join(d)).map_err(|e| e.to_string())?;
         }
         let total: u64 = files.iter().map(|(_, sz, _)| *sz).sum();
-        let clock = Instant::now();
         let mut done: u64 = 0;
         let mut changed: Vec<String> = Vec::new();
-        emit_progress(app, &job.id, 0, total, 0);
+        emit_progress(app, &job.id, 0, total);
         for (path, sz, rel) in files {
             if job.cancel.load(Ordering::Relaxed) {
                 return Ok(Outcome::Canceled);
@@ -1838,7 +1818,7 @@ async fn run_local_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
                 &job.cancel,
                 path,
                 &out,
-                Some((done, total, clock)),
+                Some((done, total)),
                 &job.conflict,
             )? {
                 (Outcome::Canceled, _) => return Ok(Outcome::Canceled),
@@ -1849,12 +1829,12 @@ async fn run_local_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
             }
             done += *sz;
         }
-        emit_progress(app, &job.id, total, total, 0);
+        emit_progress(app, &job.id, total, total);
         emit_skipped(app, &job.id, &job.name, &LeftOut { changed, ..LeftOut::of_walk(&walk) });
         Ok(Outcome::Done)
     } else {
         let total = fs::metadata(&src).map_err(|e| e.to_string())?.len();
-        emit_progress(app, &job.id, 0, total, 0);
+        emit_progress(app, &job.id, 0, total);
         let (outcome, stamp) =
             copy_file_chunked(app, &job.id, &job.cancel, &src, &dest, None, &job.conflict)?;
         if matches!(outcome, Outcome::Done) {
@@ -1903,8 +1883,7 @@ fn copy_file_chunked(
     let mut writer = create_side(&tmp).map_err(|e| e.to_string())?;
 
     let total = before.size;
-    let (base, grand_total, clock) = agg.unwrap_or((0, total, Instant::now()));
-    let started = Instant::now();
+    let (base, grand_total) = agg.unwrap_or((0, total));
     let mut done: u64 = 0;
     let mut last_emit = Instant::now() - EMIT_EVERY;
     let mut buf = vec![0u8; CHUNK as usize];
@@ -1922,13 +1901,7 @@ fn copy_file_chunked(
         writer.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         done += n as u64;
         if last_emit.elapsed() >= EMIT_EVERY {
-            let cur = base + done;
-            let (spd_bytes, spd_clock) = match agg {
-                Some(_) => (cur, clock),
-                None => (done, started),
-            };
-            let secs = spd_clock.elapsed().as_secs_f64().max(0.001);
-            emit_progress(app, id, cur, grand_total, (spd_bytes as f64 / secs) as u64);
+            emit_progress(app, id, base + done, grand_total);
             last_emit = Instant::now();
         }
     }
@@ -1993,9 +1966,8 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
         return Ok(Outcome::Canceled);
     };
     let total: u64 = objects.iter().map(|(_, sz, _)| *sz).sum();
-    let clock = Instant::now();
     let mut done: u64 = 0;
-    emit_progress(app, &job.id, 0, total, 0);
+    emit_progress(app, &job.id, 0, total);
 
     // With `skip`, an object already at the destination is left as it is and its
     // source is not counted as sent, the same as a folder download does.
@@ -2029,7 +2001,7 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
         emit_current_file(app, &job.id, rel);
         match remote_copy_stream(
             app, &client, &bucket, key, &dest_key, &job.id,
-            Some((done, total, clock)), &job.cancel,
+            Some((done, total)), &job.cancel,
         )
         .await
         {
@@ -2042,7 +2014,7 @@ async fn run_remote_copy(app: &AppHandle, job: &Job) -> Result<Outcome, String> 
         }
         done += *sz;
     }
-    emit_progress(app, &job.id, total, total, 0);
+    emit_progress(app, &job.id, total, total);
     emit_skipped(app, &job.id, &job.name, &LeftOut { changed, ..Default::default() });
     Ok(Outcome::Done)
 }
@@ -2096,13 +2068,15 @@ async fn copy_object_checked(
         .send()
         .await
     {
-        Ok(_) => {}
-        Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 412) => {
-            return Err(ERR_SOURCE_CHANGED.into());
+        Ok(o) => {
+            let written = o.copy_object_result().and_then(|r| r.e_tag());
+            verify_written(client, bucket, dest_key, total, written).await
         }
-        Err(e) => return Err(s3_err(&e)),
+        Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 412) => {
+            Err(ERR_SOURCE_CHANGED.into())
+        }
+        Err(e) => Err(s3_err(&e)),
     }
-    verify_object_size(client, bucket, dest_key, total).await
 }
 
 /// The server-side copy, tried once more when the source changed between the
@@ -2162,7 +2136,7 @@ async fn remote_copy_stream(
     // to it, so a source replaced meanwhile fails instead of arriving mixed.
     let etag = head.e_tag().unwrap_or_default().to_string();
     let version = (!etag.is_empty()).then_some(etag.as_str());
-    let (base, grand_total, clock) = agg.unwrap_or((0, total, Instant::now()));
+    let (base, grand_total) = agg.unwrap_or((0, total));
 
     if total == 0 {
         retry3(|| {
@@ -2175,7 +2149,7 @@ async fn remote_copy_stream(
         })
         .await
         .map_err(|e| format!("PUT {dest_key}: {}", s3_err(&e)))?;
-        emit_progress(app, id, base, grand_total, 0);
+        emit_progress(app, id, base, grand_total);
         return Ok((Outcome::Done, Some(etag.clone())));
     }
 
@@ -2185,7 +2159,7 @@ async fn remote_copy_stream(
         }
         match server_copy(client, bucket, src_key, dest_key, total, &etag).await {
             Ok(copied) => {
-                emit_progress(app, id, base + total, grand_total, 0);
+                emit_progress(app, id, base + total, grand_total);
                 return Ok((Outcome::Done, Some(copied)));
             }
             // Reading it through the app would only copy the new version.
@@ -2204,7 +2178,7 @@ async fn remote_copy_stream(
             .await
             .map_err(|e| if e == ERR_CHANGED { ERR_SOURCE_CHANGED.to_string() } else { e })?;
         put_object_verified(client, bucket, dest_key, &data).await?;
-        emit_progress(app, id, base + total, grand_total, 0);
+        emit_progress(app, id, base + total, grand_total);
         return Ok((Outcome::Done, Some(etag.clone())));
     }
 
@@ -2227,7 +2201,6 @@ async fn remote_copy_stream(
 
     let mut parts: Vec<CompletedPart> = Vec::new();
     let mut sent: u64 = 0;
-    let started = Instant::now();
     let mut last_emit = Instant::now() - EMIT_EVERY;
 
     // A part that fails leaves nothing half-made on the server.
@@ -2283,13 +2256,7 @@ async fn remote_copy_stream(
         );
         sent += n;
         if last_emit.elapsed() >= EMIT_EVERY {
-            let cur = base + sent;
-            let (sb, sc) = match agg {
-                Some(_) => (cur, clock),
-                None => (sent, started),
-            };
-            let secs = sc.elapsed().as_secs_f64().max(0.001);
-            emit_progress(app, id, cur, grand_total, (sb as f64 / secs) as u64);
+            emit_progress(app, id, base + sent, grand_total);
             last_emit = Instant::now();
         }
     }
@@ -2297,7 +2264,7 @@ async fn remote_copy_stream(
     let completed = CompletedMultipartUpload::builder()
         .set_parts(Some(parts))
         .build();
-    if let Err(e) = retry3(|| {
+    let done = match retry3(|| {
         client
             .complete_multipart_upload()
             .bucket(bucket)
@@ -2308,10 +2275,13 @@ async fn remote_copy_stream(
     })
     .await
     {
-        abort().await;
-        return Err(format!("CompleteMultipartUpload {dest_key}: {}", s3_err(&e)));
-    }
-    verify_object_size(client, bucket, dest_key, total).await?;
+        Ok(done) => done,
+        Err(e) => {
+            abort().await;
+            return Err(format!("CompleteMultipartUpload {dest_key}: {}", s3_err(&e)));
+        }
+    };
+    verify_written(client, bucket, dest_key, total, done.e_tag()).await?;
     Ok((Outcome::Done, Some(etag.clone())))
 }
 
@@ -2422,9 +2392,8 @@ async fn run_upload(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
     };
     let (files, empty_dirs) = (&walk.files, &walk.empty_dirs);
     let total: u64 = files.iter().map(|(_, sz, _)| *sz).sum();
-    let clock = Instant::now();
     let mut done: u64 = 0;
-    emit_progress(app, &job.id, 0, total, 0);
+    emit_progress(app, &job.id, 0, total);
 
     // With `skip`, an object already at the destination is left as it is and its
     // file is not counted as sent. That is also what lets a half-done folder
@@ -2446,13 +2415,13 @@ async fn run_upload(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
         }
         if existing.contains(&key) {
             done += *sz;
-            emit_progress(app, &job.id, done, total, 0);
+            emit_progress(app, &job.id, done, total);
             continue;
         }
         emit_current_file(app, &job.id, rel);
         match upload_one(
             app, &client, &bucket, &key, path, &job.id, &job.cancel,
-            Some((done, total, clock)),
+            Some((done, total)),
         )
         .await?
         {
@@ -2478,7 +2447,7 @@ async fn run_upload(app: &AppHandle, job: &Job) -> Result<Outcome, String> {
             .send()
             .await;
     }
-    emit_progress(app, &job.id, total, total, 0);
+    emit_progress(app, &job.id, total, total);
     emit_skipped(app, &job.id, &job.name, &LeftOut { changed, ..LeftOut::of_walk(&walk) });
     Ok(Outcome::Done)
 }
@@ -2677,6 +2646,37 @@ async fn usable_resume(
     None
 }
 
+/// The upload a resume record points at, with the parts the server already
+/// holds: its id, its part size and the parts. `None` means a fresh upload.
+///
+/// Only an upload the server says it no longer has starts over. Any other
+/// failure of the listing ends the job with the record and the upload in
+/// place, so the next try continues from the parts already sent.
+async fn parts_to_continue(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    r: UploadResume,
+    sidecar: &Path,
+) -> Result<Option<(String, u64, HashMap<i32, String>)>, String> {
+    match list_parts_all(client, bucket, key, &r.upload_id).await {
+        Ok(done) => Ok(Some((r.upload_id, r.part_size, done))),
+        Err(PartsErr::Gone) => {
+            // The record goes with the upload it described.
+            drop_changed_upload(client, bucket, key, &r.upload_id, sidecar).await;
+            Ok(None)
+        }
+        Err(PartsErr::Other(e)) => Err(format!("ListParts {key}: {e}")),
+    }
+}
+
+/// Why the parts of an upload could not be listed.
+enum PartsErr {
+    /// The server has no such upload any more.
+    Gone,
+    Other(String),
+}
+
 /// Uploads one file, in parts, continuing an earlier attempt when the sidecar
 /// matches. A file sent in full comes back with the stamp it was read under, so
 /// a Move can tell it was replaced since; one that changed while it was read is
@@ -2700,7 +2700,7 @@ async fn upload_one(
     // The resume record is read and written only as a plain file (N4).
     clear_link(&sidecar).map_err(|e| e.to_string())?;
 
-    let (base, grand_total, clock) = agg.unwrap_or((0, total, Instant::now()));
+    let (base, grand_total) = agg.unwrap_or((0, total));
 
     // An empty file cannot be a multipart upload with zero parts.
     if total == 0 {
@@ -2713,7 +2713,7 @@ async fn upload_one(
             .await
             .map_err(|e| s3_err(&e))?;
         drop_earlier_attempt(client, bucket, key, &sidecar).await;
-        emit_progress(app, id, base, grand_total, 0);
+        emit_progress(app, id, base, grand_total);
         return Ok((Outcome::Done, Some(source_stamp(&meta))));
     }
 
@@ -2738,7 +2738,7 @@ async fn upload_one(
         put_object_verified(client, bucket, key, &data).await?;
         // An earlier multipart attempt, when the file was larger, is over.
         drop_earlier_attempt(client, bucket, key, &sidecar).await;
-        emit_progress(app, id, base + total, grand_total, 0);
+        emit_progress(app, id, base + total, grand_total);
         return Ok((Outcome::Done, Some(before)));
     }
 
@@ -2754,15 +2754,12 @@ async fn upload_one(
 
     let resumed = usable_resume(client, bucket, key, &source, &sidecar).await;
 
-    let (upload_id, part_size, mut done) = match resumed {
-        Some(r) => match list_parts_all(client, bucket, key, &r.upload_id).await {
-            Ok(done) => (r.upload_id, r.part_size, done),
-            // The upload starts over, and the one it leaves goes with its record.
-            Err(_) => {
-                drop_changed_upload(client, bucket, key, &r.upload_id, &sidecar).await;
-                fresh_upload(client, bucket, key, default_part, &source, &sidecar).await?
-            }
-        },
+    let continued = match resumed {
+        Some(r) => parts_to_continue(client, bucket, key, r, &sidecar).await?,
+        None => None,
+    };
+    let (upload_id, part_size, mut done) = match continued {
+        Some(c) => c,
         None => fresh_upload(client, bucket, key, default_part, &source, &sidecar).await?,
     };
 
@@ -2770,8 +2767,6 @@ async fn upload_one(
     let mut buf = vec![0u8; part_size as usize];
     let mut parts: Vec<CompletedPart> = Vec::new();
     let mut sent: u64 = 0;
-    let started = Instant::now();
-    let mut resume_bytes: u64 = 0;
     let mut last_emit = Instant::now() - EMIT_EVERY;
 
     for pn in 1..=num_parts {
@@ -2781,7 +2776,6 @@ async fn upload_one(
         if let Some(etag) = done.remove(&pn) {
             parts.push(CompletedPart::builder().part_number(pn).e_tag(etag).build());
             sent += part_len;
-            resume_bytes += part_len;
             continue;
         }
 
@@ -2838,13 +2832,7 @@ async fn upload_one(
         sent += part_len;
 
         if last_emit.elapsed() >= EMIT_EVERY || sent >= total {
-            let cur = base + sent;
-            let (spd_bytes, spd_clock) = match agg {
-                Some(_) => (cur, clock),
-                None => (sent - resume_bytes, started),
-            };
-            let secs = spd_clock.elapsed().as_secs_f64().max(0.001);
-            emit_progress(app, id, cur, grand_total, (spd_bytes as f64 / secs) as u64);
+            emit_progress(app, id, base + sent, grand_total);
             last_emit = Instant::now();
         }
     }
@@ -2860,7 +2848,7 @@ async fn upload_one(
     let completed = CompletedMultipartUpload::builder()
         .set_parts(Some(parts))
         .build();
-    client
+    let done = client
         .complete_multipart_upload()
         .bucket(bucket)
         .key(key)
@@ -2871,7 +2859,7 @@ async fn upload_one(
         .map_err(|e| s3_err(&e))?; // the sidecar survives, so a retry resumes
 
     let _ = fs::remove_file(&sidecar);
-    verify_object_size(client, bucket, key, total).await?;
+    verify_written(client, bucket, key, total, done.e_tag()).await?;
     Ok((Outcome::Done, Some(source)))
 }
 
@@ -2989,7 +2977,7 @@ async fn list_parts_all(
     bucket: &str,
     key: &str,
     upload_id: &str,
-) -> Result<HashMap<i32, String>, String> {
+) -> Result<HashMap<i32, String>, PartsErr> {
     let mut done = HashMap::new();
     let mut marker: Option<String> = None;
     // S3 allows at most 10 000 parts to an upload.
@@ -3003,7 +2991,13 @@ async fn list_parts_all(
         if let Some(m) = &marker {
             req = req.part_number_marker(m);
         }
-        let resp = req.send().await.map_err(|e| s3_err(&e))?;
+        let resp = req.send().await.map_err(|e| {
+            if e.code() == Some("NoSuchUpload") {
+                PartsErr::Gone
+            } else {
+                PartsErr::Other(s3_err(&e))
+            }
+        })?;
         for p in resp.parts() {
             if let (Some(n), Some(et)) = (p.part_number(), p.e_tag()) {
                 done.insert(n, et.to_string());
@@ -3014,7 +3008,9 @@ async fn list_parts_all(
             resp.next_part_number_marker(),
             marker.as_deref(),
         );
-        guard.page(resp.parts().len(), marker.as_deref()).map_err(|stop| stop.to_string())?;
+        guard
+            .page(resp.parts().len(), marker.as_deref())
+            .map_err(|stop| PartsErr::Other(stop.to_string()))?;
         if marker.is_none() {
             break;
         }
@@ -3164,14 +3160,15 @@ pub async fn abort_orphan_uploads(
     Ok(n)
 }
 
-fn emit_progress(app: &AppHandle, id: &str, done: u64, total: u64, speed: u64) {
+/// Reports how far a job has got. The speed is worked out where it is shown,
+/// from these reports.
+fn emit_progress(app: &AppHandle, id: &str, done: u64, total: u64) {
     let _ = app.emit(
         "transfer-progress",
         ProgressEvt {
             id: id.to_string(),
             bytes_done: done,
             bytes_total: total,
-            speed,
         },
     );
 }
@@ -4154,7 +4151,7 @@ mod network_mark_tests {
 
 #[cfg(test)]
 mod stale_resume_tests {
-    use super::{SourceStamp, UploadResume, drop_earlier_attempt, usable_resume};
+    use super::{SourceStamp, UploadResume, drop_earlier_attempt, parts_to_continue, usable_resume};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::SdkBody;
     use aws_smithy_http_client::test_util::infallible_client_fn;
@@ -4181,6 +4178,73 @@ mod stale_resume_tests {
 
     fn stamp(mtime_ns: u64) -> SourceStamp {
         SourceStamp { size: 4, mtime_ns, id: "7".into() }
+    }
+
+    /// A client whose server answers `ListParts` with `status` and `body`, any
+    /// other request with an empty success, and records each as "METHOD path?query".
+    fn answering_list_parts(status: u16, body: &'static str) -> (Client, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let http = infallible_client_fn(move |req: http::Request<SdkBody>| {
+            let target = req.uri().path_and_query().map_or("", |p| p.as_str()).to_string();
+            log.lock().unwrap().push(format!("{} {target}", req.method()));
+            if req.method() == http::Method::GET {
+                http::Response::builder().status(status).body(SdkBody::from(body)).unwrap()
+            } else {
+                http::Response::builder().status(204).body(SdkBody::empty()).unwrap()
+            }
+        });
+        let (client, _) = crate::core::s3_client_from_parts(
+            "https://gateway.test", "eu-ro-1", "b", "AKIDTEST", "not-a-secret",
+        );
+        let conf = client.config().to_builder().http_client(http).build();
+        (Client::from_conf(conf), seen)
+    }
+
+    fn resume(upload_id: &str) -> UploadResume {
+        UploadResume { key: "k".into(), upload_id: upload_id.into(), part_size: 8, source: stamp(1) }
+    }
+
+    const ONE_PART: &str = "<ListPartsResult><IsTruncated>false</IsTruncated>\
+        <Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag><Size>8</Size></Part></ListPartsResult>";
+    const GONE: &str =
+        "<Error><Code>NoSuchUpload</Code><Message>Upload session not found</Message></Error>";
+    const DENIED: &str = "<Error><Code>AccessDenied</Code><Message>no</Message></Error>";
+
+    #[tokio::test]
+    async fn an_upload_the_server_still_holds_continues_from_its_parts() {
+        let (d, p) = sidecar("parts", &record("k", "u1", stamp(1)));
+        let (client, seen) = answering_list_parts(200, ONE_PART);
+        let got = parts_to_continue(&client, "b", "k", resume("u1"), &p).await;
+        let kept = p.exists();
+        let _ = fs::remove_dir_all(&d);
+        let (id, part_size, done) = got.unwrap().expect("the upload continues");
+        assert_eq!((id.as_str(), part_size, done.get(&1).map(String::as_str)), ("u1", 8, Some("\"e1\"")));
+        assert!(kept && seen.lock().unwrap().iter().all(|r| r.starts_with("GET ")));
+    }
+
+    #[tokio::test]
+    async fn an_upload_the_server_no_longer_holds_starts_over() {
+        let (d, p) = sidecar("gone", &record("k", "u1", stamp(1)));
+        let (client, _) = answering_list_parts(404, GONE);
+        let got = parts_to_continue(&client, "b", "k", resume("u1"), &p).await;
+        let kept = p.exists();
+        let _ = fs::remove_dir_all(&d);
+        assert!(matches!(got, Ok(None)), "a fresh upload is what is left");
+        assert!(!kept, "the record of an upload that is gone goes too");
+    }
+
+    #[tokio::test]
+    async fn a_parts_listing_that_fails_keeps_the_upload_and_its_record() {
+        let (d, p) = sidecar("failed", &record("k", "u1", stamp(1)));
+        let (client, seen) = answering_list_parts(403, DENIED);
+        let got = parts_to_continue(&client, "b", "k", resume("u1"), &p).await;
+        let kept = p.exists();
+        let _ = fs::remove_dir_all(&d);
+        assert!(got.is_err(), "the job fails instead of starting over");
+        assert!(kept, "the record stays for the next try");
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().all(|r| !r.starts_with("DELETE ")), "the upload was aborted: {seen:?}");
     }
 
     /// A sidecar holding `text`, in a folder of its own; the folder is returned

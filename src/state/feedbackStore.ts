@@ -17,7 +17,7 @@ import { t } from "../locale/en";
 /* The Feedback screen's state: what the user wrote, the recording that goes
    with it, and whether a recording is running.
 
-   Recording is two steps from the user's side: Record the problem closes
+   Recording is two steps from the user's side: Log the problem closes
    Settings and puts a pill in the status bar; Stop & send brings the Feedback
    screen back with the recording attached in a box of its own. The recording
    itself lives in a file on the Rust side, so it survives a crash and is
