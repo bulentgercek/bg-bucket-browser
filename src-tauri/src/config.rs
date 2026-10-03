@@ -678,10 +678,13 @@ mod save_tests {
                 Ok(())
             });
             assert!(out.is_err(), "write {nth} was refused, the save must fail");
+            // The message says which write and what went wrong, never what the
+            // store holds: a key has no place in any output, a test's included.
             let (access, secret) = keys.pair("c");
+            let old_key_left = access == Some("old-access") || secret == Some("old-secret");
             assert!(
-                !(moved && (access == Some("old-access") || secret == Some("old-secret"))),
-                "write {nth} refused: the connection points at the new endpoint and still holds {access:?} / {secret:?}"
+                !(moved && old_key_left),
+                "write {nth} refused: the connection points at the new endpoint and still holds an old key"
             );
         }
     }
